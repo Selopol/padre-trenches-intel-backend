@@ -395,7 +395,8 @@ class DatabaseOps:
             SELECT COUNT(*) FROM tokens 
             WHERE creator_wallet = ? AND is_graduated = 1
         ''', (wallet,))
-        graduated_tokens = cursor.fetchone()[0] or 0
+        result = cursor.fetchone()
+        graduated_tokens = result[0] if result else 0
         migration_percentage = (graduated_tokens / total_tokens * 100) if total_tokens > 0 else 0
         
         # Get last migration time
@@ -403,13 +404,15 @@ class DatabaseOps:
             SELECT MAX(graduated_at) FROM tokens 
             WHERE creator_wallet = ? AND is_graduated = 1
         ''', (wallet,))
-        last_migration = cursor.fetchone()[0]
+        result = cursor.fetchone()
+        last_migration = result[0] if result else None
         
         # Get last token launch time
         DatabaseOps.execute(cursor, '''
             SELECT MAX(created_at) FROM tokens WHERE creator_wallet = ?
         ''', (wallet,))
-        last_launch = cursor.fetchone()[0]
+        result = cursor.fetchone()
+        last_launch = result[0] if result else None
         
         # Get twitter handle ONLY from community links (ignore tweets)
         DatabaseOps.execute(cursor, '''
