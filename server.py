@@ -534,7 +534,7 @@ async def scan_pump_tokens():
         except Exception as e:
             logger.error(f"Error in token scanner: {e}")
         
-        await asyncio.sleep(120)  # Scan every 2 minutes
+        await asyncio.sleep(10)  # Scan every 10 seconds
 
 # WebSocket manager
 class ConnectionManager:
