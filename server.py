@@ -418,6 +418,9 @@ class DatabaseOps:
             graduated_tokens = cursor.fetchone()[0]
             
             # Calculate migration percentage
+            # If total_tokens is 0 but we have graduated tokens, use graduated_tokens as total
+            if total_tokens == 0 and graduated_tokens > 0:
+                total_tokens = graduated_tokens
             migration_percentage = (graduated_tokens / total_tokens * 100) if total_tokens > 0 else 0
             
             # Get last migration time
@@ -544,28 +547,42 @@ class DatabaseOps:
     
     @staticmethod
     def get_db_stats() -> Dict:
-        conn = DatabaseOps.get_connection()
-        cursor = conn.cursor()
-        
-        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens')
-        total_tokens = cursor.fetchone()[0]
-        
-        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens WHERE is_graduated = 1')
-        graduated_tokens = cursor.fetchone()[0]
-        
-        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM developers')
-        total_devs = cursor.fetchone()[0]
-        
-        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM developers WHERE graduated_tokens > 0')
-        active_devs = cursor.fetchone()[0]
-        
-        conn.close()
-        return {
-            "total_tokens": total_tokens,
-            "graduated_tokens": graduated_tokens,
-            "total_developers": total_devs,
-            "active_developers": active_devs
-        }
+        try:
+            conn = DatabaseOps.get_connection()
+            cursor = conn.cursor()
+            
+            DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens')
+            total_tokens = cursor.fetchone()[0]
+            
+            # Use TRUE for PostgreSQL, 1 for SQLite
+            if USE_POSTGRES:
+                DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens WHERE is_graduated = TRUE')
+            else:
+                DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens WHERE is_graduated = 1')
+            graduated_tokens = cursor.fetchone()[0]
+            
+            DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM developers')
+            total_devs = cursor.fetchone()[0]
+            
+            DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM developers WHERE graduated_tokens > 0')
+            active_devs = cursor.fetchone()[0]
+            
+            conn.close()
+            return {
+                "total_tokens": total_tokens,
+                "graduated_tokens": graduated_tokens,
+                "total_developers": total_devs,
+                "active_developers": active_devs
+            }
+        except Exception as e:
+            logger.error(f"Error getting db stats: {e}")
+            return {
+                "total_tokens": 0,
+                "graduated_tokens": 0,
+                "total_developers": 0,
+                "active_developers": 0,
+                "error": str(e)
+            }
 
 
 # ============== PumpPortal WebSocket ==============
@@ -811,7 +828,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Padre Trenches Dev Intel API",
-    version="7.0.0",
+    version="7.0.1",
     lifespan=lifespan
 )
 
@@ -830,7 +847,7 @@ app.add_middleware(
 async def root():
     return {
         "name": "Padre Trenches Dev Intel API",
-        "version": "7.0.0",
+        "version": "7.0.1",
         "status": "running",
         "api": "PumpPortal WebSocket + DexScreener + Helius",
         "endpoints": [
