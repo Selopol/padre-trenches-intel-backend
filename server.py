@@ -375,7 +375,12 @@ class DatabaseOps:
     @staticmethod
     def execute(cursor, query, params=None):
         if USE_POSTGRES:
-            query = query.replace('= 0', '= FALSE').replace('= 1', '= TRUE')
+            # Only convert boolean comparisons for is_graduated and processed fields
+            # Use regex-like specific replacements to avoid breaking numeric comparisons
+            query = query.replace('is_graduated = 0', 'is_graduated = FALSE')
+            query = query.replace('is_graduated = 1', 'is_graduated = TRUE')
+            query = query.replace('processed = 0', 'processed = FALSE')
+            query = query.replace('processed = 1', 'processed = TRUE')
             query = query.replace("'%", "'%%").replace("%'", "%%'")
             query = query.replace('?', '%s')
             if 'INSERT OR REPLACE INTO tokens' in query:
