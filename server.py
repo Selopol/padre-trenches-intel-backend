@@ -275,49 +275,73 @@ class HeliusClient:
         self.session = requests.Session()
     
     def get_transactions_for_address(self, address: str, before: str = None, limit: int = 100) -> List[Dict]:
-        """Get transaction history for an address"""
+        """Get transaction history for an address (without type filter to get all transactions)"""
         try:
-            url = f"https://api.helius.xyz/v0/addresses/{address}/transactions?api-key={self.api_key}"
-            params = {"limit": limit}
+            url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
+            params = {"api-key": self.api_key, "limit": limit}
             if before:
                 params["before"] = before
             
             response = self.session.get(url, params=params, timeout=30)
             if response.status_code == 200:
-                return response.json()
+                txs = response.json()
+                logger.info(f"Helius API returned {len(txs)} transactions")
+                return txs
+            else:
+                logger.error(f"Helius API error: {response.status_code}")
             return []
         except Exception as e:
             logger.error(f"Error fetching transactions: {e}")
             return []
     
+    def find_pump_token_in_transaction(self, tx: Dict) -> Optional[str]:
+        """Find pump token mint address in a transaction using multiple methods"""
+        try:
+            # Method 1: Through tokenTransfers (primary)
+            if "tokenTransfers" in tx:
+                for transfer in tx["tokenTransfers"]:
+                    mint = transfer.get("mint", "")
+                    if mint.endswith("pump"):
+                        return mint
+            
+            # Method 2: Through accountData tokenBalanceChanges
+            if "accountData" in tx:
+                for account in tx["accountData"]:
+                    # Check tokenBalanceChanges
+                    for change in account.get("tokenBalanceChanges", []):
+                        mint = change.get("mint", "")
+                        if mint.endswith("pump"):
+                            return mint
+                    # Check tokenMint field
+                    token_mint = account.get("tokenMint", "")
+                    if token_mint.endswith("pump"):
+                        return token_mint
+            
+            # Method 3: Through instructions accounts
+            if "instructions" in tx:
+                for ix in tx["instructions"]:
+                    for account in ix.get("accounts", []):
+                        if isinstance(account, str) and account.endswith("pump"):
+                            return account
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error finding pump token: {e}")
+            return None
+    
     def parse_migration_transaction(self, tx: Dict) -> Optional[Dict]:
         """Parse a transaction to extract migration info from Helius REST API format"""
         try:
-            # Helius REST API returns tokenTransfers array
-            token_transfers = tx.get("tokenTransfers", [])
+            token_mint = self.find_pump_token_in_transaction(tx)
             
-            for transfer in token_transfers:
-                mint = transfer.get("mint", "")
-                if mint.endswith("pump"):
-                    return {
-                        "token_mint": mint,
-                        "signature": tx.get("signature"),
-                        "slot": tx.get("slot"),
-                        "timestamp": tx.get("timestamp")
-                    }
-            
-            # Also check accountData for token balance changes
-            account_data = tx.get("accountData", [])
-            for account in account_data:
-                for change in account.get("tokenBalanceChanges", []):
-                    mint = change.get("mint", "")
-                    if mint.endswith("pump"):
-                        return {
-                            "token_mint": mint,
-                            "signature": tx.get("signature"),
-                            "slot": tx.get("slot"),
-                            "timestamp": tx.get("timestamp")
-                        }
+            if token_mint:
+                return {
+                    "token_mint": token_mint,
+                    "signature": tx.get("signature"),
+                    "slot": tx.get("slot"),
+                    "timestamp": tx.get("timestamp"),
+                    "type": tx.get("type", "UNKNOWN")
+                }
             return None
         except Exception as e:
             logger.error(f"Error parsing transaction: {e}")
@@ -837,14 +861,23 @@ async def load_historical_migrations():
             txs = helius_client.get_transactions_for_address(PUMPSWAP_PROGRAM, before=before, limit=100)
             
             if not txs:
+                logger.info(f"No more transactions at page {page}")
                 break
             
+            # Debug: Log first transaction structure on first page
+            if page == 0 and txs:
+                first_tx = txs[0]
+                logger.info(f"First tx type: {first_tx.get('type')}, has tokenTransfers: {'tokenTransfers' in first_tx}")
+                logger.info(f"First tx keys: {list(first_tx.keys())[:10]}")
+            
+            pump_tokens_found = 0
             for tx in txs:
                 signature = tx.get("signature")
                 
                 # Parse transaction for pump tokens
                 migration = helius_client.parse_migration_transaction(tx)
                 if migration:
+                    pump_tokens_found += 1
                     token_mint = migration["token_mint"]
                     
                     if token_mint in existing_mints:
@@ -868,6 +901,8 @@ async def load_historical_migrations():
                         
                         if total_loaded % 10 == 0:
                             logger.info(f"Loaded {total_loaded} historical migrations...")
+            
+            logger.info(f"Page {page}: Found {pump_tokens_found} pump tokens in {len(txs)} transactions")
             
             # Get cursor for next page
             if txs:
