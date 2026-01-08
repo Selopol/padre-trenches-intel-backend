@@ -265,11 +265,18 @@ class DatabaseOps:
     
     @staticmethod
     def update_developer_stats(wallet: str):
-        """Update developer statistics"""
+        """Update developer statistics by fetching ALL tokens from Pump.fun"""
         conn = DatabaseOps.get_connection()
         cursor = conn.cursor()
         
-        # Count total and graduated tokens
+        # Fetch ALL tokens from this developer via Pump.fun API
+        all_user_tokens = pumpfun_client.fetch_user_coins(wallet, limit=1000)
+        
+        # Save all tokens to database (including non-migrated)
+        for token in all_user_tokens:
+            DatabaseOps.save_token(token)
+        
+        # Now count from database
         cursor.execute('''
             SELECT COUNT(*), SUM(CASE WHEN is_graduated = 1 THEN 1 ELSE 0 END) 
             FROM tokens WHERE creator_wallet = ?
