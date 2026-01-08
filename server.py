@@ -287,14 +287,11 @@ class DatabaseOps:
         if USE_POSTGRES:
             # Convert SQLite BOOLEAN values to PostgreSQL first
             query = query.replace('= 0', '= FALSE').replace('= 1', '= TRUE')
-            # Protect % in LIKE clauses by temporarily replacing them
-            query = query.replace("'%", "'<PERCENT>")
-            query = query.replace("%'", "<PERCENT>'")
+            # Escape % in LIKE clauses for PostgreSQL (% → %%)
+            query = query.replace("'%", "'%%")
+            query = query.replace("%'", "%%'")
             # Convert SQLite ? placeholders to PostgreSQL %s
             query = query.replace('?', '%s')
-            # Restore % in LIKE clauses
-            query = query.replace("'<PERCENT>", "'%")
-            query = query.replace("<PERCENT>'", "%'")
             # Convert INSERT OR REPLACE to PostgreSQL UPSERT
             if 'INSERT OR REPLACE INTO tokens' in query:
                 query = query.replace('INSERT OR REPLACE INTO tokens', 
