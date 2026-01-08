@@ -323,12 +323,19 @@ class DatabaseOps:
                 query = query.replace('INSERT OR REPLACE INTO tokens', 
                     'INSERT INTO tokens').replace('VALUES (', 'VALUES (') + \
                     ' ON CONFLICT (mint) DO UPDATE SET ' + \
-                    'name=EXCLUDED.name, symbol=EXCLUDED.symbol, creator_wallet=EXCLUDED.creator_wallet, ' + \
-                    'twitter_link=EXCLUDED.twitter_link, telegram_link=EXCLUDED.telegram_link, ' + \
-                    'website_link=EXCLUDED.website_link, description=EXCLUDED.description, ' + \
-                    'image_uri=EXCLUDED.image_uri, is_graduated=EXCLUDED.is_graduated, ' + \
-                    'created_at=EXCLUDED.created_at, graduated_at=EXCLUDED.graduated_at, ' + \
-                    'market_cap=EXCLUDED.market_cap, updated_at=CURRENT_TIMESTAMP'
+                    'name=COALESCE(EXCLUDED.name, tokens.name), ' + \
+                    'symbol=COALESCE(EXCLUDED.symbol, tokens.symbol), ' + \
+                    'creator_wallet=COALESCE(EXCLUDED.creator_wallet, tokens.creator_wallet), ' + \
+                    'twitter_link=COALESCE(EXCLUDED.twitter_link, tokens.twitter_link), ' + \
+                    'telegram_link=COALESCE(EXCLUDED.telegram_link, tokens.telegram_link), ' + \
+                    'website_link=COALESCE(EXCLUDED.website_link, tokens.website_link), ' + \
+                    'description=COALESCE(EXCLUDED.description, tokens.description), ' + \
+                    'image_uri=COALESCE(EXCLUDED.image_uri, tokens.image_uri), ' + \
+                    'is_graduated=EXCLUDED.is_graduated OR tokens.is_graduated, ' + \
+                    'created_at=COALESCE(EXCLUDED.created_at, tokens.created_at), ' + \
+                    'graduated_at=COALESCE(EXCLUDED.graduated_at, tokens.graduated_at), ' + \
+                    'market_cap=COALESCE(EXCLUDED.market_cap, tokens.market_cap), ' + \
+                    'updated_at=CURRENT_TIMESTAMP'
             elif 'INSERT OR REPLACE INTO developers' in query:
                 query = query.replace('INSERT OR REPLACE INTO developers',
                     'INSERT INTO developers').replace('VALUES (', 'VALUES (') + \
@@ -354,26 +361,61 @@ class DatabaseOps:
             if is_graduated:
                 graduated_at = token_data.get("graduated_at") or datetime.utcnow().isoformat()
             
-            DatabaseOps.execute(cursor, '''
-                INSERT OR REPLACE INTO tokens 
-                (mint, name, symbol, creator_wallet, twitter_link, telegram_link, website_link, 
-                 description, image_uri, is_graduated, created_at, graduated_at, market_cap, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (
-                token_data.get("mint"),
-                token_data.get("name"),
-                token_data.get("symbol"),
-                token_data.get("creator"),
-                token_data.get("twitter"),
-                token_data.get("telegram"),
-                token_data.get("website"),
-                token_data.get("description"),
-                token_data.get("image_uri"),
-                is_graduated,
-                token_data.get("created_timestamp") or token_data.get("created_at"),
-                graduated_at,
-                token_data.get("usd_market_cap") or token_data.get("market_cap")
-            ))
+            if USE_POSTGRES:
+                cursor.execute('''
+                    INSERT INTO tokens 
+                    (mint, name, symbol, creator_wallet, twitter_link, telegram_link, website_link, 
+                     description, image_uri, is_graduated, created_at, graduated_at, market_cap, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (mint) DO UPDATE SET
+                        name = COALESCE(EXCLUDED.name, tokens.name),
+                        symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
+                        creator_wallet = COALESCE(EXCLUDED.creator_wallet, tokens.creator_wallet),
+                        twitter_link = COALESCE(EXCLUDED.twitter_link, tokens.twitter_link),
+                        telegram_link = COALESCE(EXCLUDED.telegram_link, tokens.telegram_link),
+                        website_link = COALESCE(EXCLUDED.website_link, tokens.website_link),
+                        description = COALESCE(EXCLUDED.description, tokens.description),
+                        image_uri = COALESCE(EXCLUDED.image_uri, tokens.image_uri),
+                        is_graduated = EXCLUDED.is_graduated OR tokens.is_graduated,
+                        graduated_at = COALESCE(EXCLUDED.graduated_at, tokens.graduated_at),
+                        market_cap = COALESCE(EXCLUDED.market_cap, tokens.market_cap),
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (
+                    token_data.get("mint"),
+                    token_data.get("name"),
+                    token_data.get("symbol"),
+                    token_data.get("creator"),
+                    token_data.get("twitter"),
+                    token_data.get("telegram"),
+                    token_data.get("website"),
+                    token_data.get("description"),
+                    token_data.get("image_uri"),
+                    is_graduated,
+                    token_data.get("created_timestamp") or token_data.get("created_at"),
+                    graduated_at,
+                    token_data.get("usd_market_cap") or token_data.get("market_cap")
+                ))
+            else:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO tokens 
+                    (mint, name, symbol, creator_wallet, twitter_link, telegram_link, website_link, 
+                     description, image_uri, is_graduated, created_at, graduated_at, market_cap, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (
+                    token_data.get("mint"),
+                    token_data.get("name"),
+                    token_data.get("symbol"),
+                    token_data.get("creator"),
+                    token_data.get("twitter"),
+                    token_data.get("telegram"),
+                    token_data.get("website"),
+                    token_data.get("description"),
+                    token_data.get("image_uri"),
+                    is_graduated,
+                    token_data.get("created_timestamp") or token_data.get("created_at"),
+                    graduated_at,
+                    token_data.get("usd_market_cap") or token_data.get("market_cap")
+                ))
             conn.commit()
             conn.close()
         except Exception as e:
@@ -847,7 +889,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Padre Trenches Dev Intel API",
-    version="7.0.3",
+    version="7.0.4",
     lifespan=lifespan
 )
 
@@ -866,7 +908,7 @@ app.add_middleware(
 async def root():
     return {
         "name": "Padre Trenches Dev Intel API",
-        "version": "7.0.3",
+        "version": "7.0.4",
         "status": "running",
         "api": "PumpPortal WebSocket + DexScreener + Helius",
         "endpoints": [
