@@ -426,18 +426,19 @@ class DatabaseOps:
             last_launch = result[0] if result else None
             
             # Get twitter handle ONLY from community links (ignore tweets)
-            DatabaseOps.execute(cursor, '''
-                SELECT twitter_link FROM tokens 
-                WHERE creator_wallet = ? AND twitter_link LIKE '%/i/communities/%' LIMIT 1
-            ''', (wallet,))
-            twitter_result = cursor.fetchone()
+            # TEMPORARILY DISABLED: Twitter API calls are slow and block dev stats updates
             twitter_handle = None
-            if twitter_result:
-                twitter_link = twitter_result[0]
-                # Extract community admin via twitterapi.io
-                community_id = twitter_client.extract_community_id(twitter_link)
-                if community_id:
-                    twitter_handle = twitter_client.get_community_admin(community_id)
+            # DatabaseOps.execute(cursor, '''
+            #     SELECT twitter_link FROM tokens 
+            #     WHERE creator_wallet = ? AND twitter_link LIKE '%/i/communities/%' LIMIT 1
+            # ''', (wallet,))
+            # twitter_result = cursor.fetchone()
+            # if twitter_result:
+            #     twitter_link = twitter_result[0]
+            #     # Extract community admin via twitterapi.io
+            #     community_id = twitter_client.extract_community_id(twitter_link)
+            #     if community_id:
+            #         twitter_handle = twitter_client.get_community_admin(community_id)
             
             DatabaseOps.execute(cursor, '''
                 INSERT OR REPLACE INTO developers 
