@@ -10,6 +10,12 @@ import asyncio
 import logging
 import sqlite3
 import re
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from contextlib import asynccontextmanager
@@ -23,7 +29,9 @@ import uvicorn
 # Configuration
 PUMPFUN_API_URL = "https://frontend-api-v3.pump.fun"
 TWITTER_API_KEY = "new1_defb379335c44d58890c0e2c59ada78f"
-DATABASE_PATH = os.getenv("DATABASE_PATH", "dev_intel.db")
+DATABASE_URL = os.getenv("DATABASE_URL", None)  # PostgreSQL URL from Railway
+DATABASE_PATH = os.getenv("DATABASE_PATH", "dev_intel.db")  # SQLite fallback
+USE_POSTGRES = DATABASE_URL is not None and POSTGRES_AVAILABLE
 
 # Logging setup
 logging.basicConfig(
@@ -34,58 +42,111 @@ logger = logging.getLogger(__name__)
 
 # Database setup
 def init_database():
-    """Initialize SQLite database with required tables"""
-    conn = sqlite3.connect(DATABASE_PATH)
+    """Initialize database with required tables (SQLite or PostgreSQL)"""
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+    else:
+        conn = sqlite3.connect(DATABASE_PATH)
+    
     cursor = conn.cursor()
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS tokens (
-            mint TEXT PRIMARY KEY,
-            name TEXT,
-            symbol TEXT,
-            creator_wallet TEXT,
-            twitter_link TEXT,
-            telegram_link TEXT,
-            website_link TEXT,
-            description TEXT,
-            image_uri TEXT,
-            is_graduated BOOLEAN DEFAULT 0,
-            created_at TIMESTAMP,
-            graduated_at TIMESTAMP,
-            market_cap REAL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS developers (
-            wallet TEXT PRIMARY KEY,
-            twitter_handle TEXT,
-            total_tokens INTEGER DEFAULT 0,
-            graduated_tokens INTEGER DEFAULT 0,
-            migration_percentage REAL DEFAULT 0,
-            last_migration_at TIMESTAMP,
-            last_token_launch_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type TEXT,
-            dev_wallet TEXT,
-            token_mint TEXT,
-            data TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            processed BOOLEAN DEFAULT 0
-        )
-    ''')
+    if USE_POSTGRES:
+        # PostgreSQL schema (use SERIAL for auto-increment, FALSE instead of 0)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tokens (
+                mint TEXT PRIMARY KEY,
+                name TEXT,
+                symbol TEXT,
+                creator_wallet TEXT,
+                twitter_link TEXT,
+                telegram_link TEXT,
+                website_link TEXT,
+                description TEXT,
+                image_uri TEXT,
+                is_graduated BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP,
+                graduated_at TIMESTAMP,
+                market_cap REAL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS developers (
+                wallet TEXT PRIMARY KEY,
+                twitter_handle TEXT,
+                total_tokens INTEGER DEFAULT 0,
+                graduated_tokens INTEGER DEFAULT 0,
+                migration_percentage REAL DEFAULT 0,
+                last_migration_at TIMESTAMP,
+                last_token_launch_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id SERIAL PRIMARY KEY,
+                event_type TEXT,
+                dev_wallet TEXT,
+                token_mint TEXT,
+                data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                processed BOOLEAN DEFAULT FALSE
+            )
+        ''')
+    else:
+        # SQLite schema
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tokens (
+                mint TEXT PRIMARY KEY,
+                name TEXT,
+                symbol TEXT,
+                creator_wallet TEXT,
+                twitter_link TEXT,
+                telegram_link TEXT,
+                website_link TEXT,
+                description TEXT,
+                image_uri TEXT,
+                is_graduated BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP,
+                graduated_at TIMESTAMP,
+                market_cap REAL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS developers (
+                wallet TEXT PRIMARY KEY,
+                twitter_handle TEXT,
+                total_tokens INTEGER DEFAULT 0,
+                graduated_tokens INTEGER DEFAULT 0,
+                migration_percentage REAL DEFAULT 0,
+                last_migration_at TIMESTAMP,
+                last_token_launch_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT,
+                dev_wallet TEXT,
+                token_mint TEXT,
+                data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                processed BOOLEAN DEFAULT 0
+            )
+        ''')
     
     conn.commit()
     conn.close()
-    logger.info("Database initialized successfully")
+    db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
+    logger.info(f"Database initialized successfully ({db_type})")
 
 # Pump.fun API Client
 class PumpFunClient:
@@ -215,7 +276,10 @@ twitter_client = TwitterClient(TWITTER_API_KEY)
 class DatabaseOps:
     @staticmethod
     def get_connection():
-        return sqlite3.connect(DATABASE_PATH)
+        if USE_POSTGRES:
+            return psycopg2.connect(DATABASE_URL)
+        else:
+            return sqlite3.connect(DATABASE_PATH)
     
     @staticmethod
     def save_token(token_data: Dict):
