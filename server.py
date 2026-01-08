@@ -897,10 +897,10 @@ async def extract_and_save_migration(tx_data: Dict, signature: str):
         logger.error(f"Error extracting migration: {e}")
 
 
-# Historical migration loader
+# Historical migration loader - HELIUS ONLY (no pump.fun dependency)
 async def load_historical_migrations():
-    """Load historical migrations from pump.fun graduated tokens API"""
-    logger.info("=== Starting historical migrations load ===")
+    """Load historical migrations from Helius API only (pump.fun blocked)"""
+    logger.info("=== Starting historical migrations load (Helius-only) ===")
     
     # Load existing tokens to avoid duplicates
     try:
@@ -919,66 +919,119 @@ async def load_historical_migrations():
         logger.info("Skipping historical load - database already populated")
         return
     
-    # Use pump.fun API to get graduated tokens directly
-    logger.info("Fetching graduated tokens from pump.fun API...")
-    total_loaded = 0
-    offset = 0
-    limit = 50
-    max_tokens = 1000  # Limit to prevent too long loading
+    # Use Helius API to get PumpSwap transactions
+    logger.info(f"Fetching PumpSwap transactions from Helius API...")
+    logger.info(f"Program: {PUMPSWAP_PROGRAM}")
     
-    while total_loaded < max_tokens:
+    total_loaded = 0
+    before = None
+    max_pages = 100  # Up to 10,000 transactions
+    unique_tokens = set()
+    
+    for page in range(max_pages):
         try:
-            logger.info(f"Requesting graduated tokens: offset={offset}, limit={limit}")
+            logger.info(f"Requesting page {page} from Helius...")
             
-            # Get graduated tokens from pump.fun
-            tokens = pumpfun_client.get_graduated_tokens(limit=limit, offset=offset)
+            txs = helius_client.get_transactions_for_address(PUMPSWAP_PROGRAM, before=before, limit=100)
             
-            if not tokens:
-                logger.info(f"No more graduated tokens at offset {offset}")
+            if not txs:
+                logger.info(f"No more transactions at page {page}")
                 break
             
-            logger.info(f"Got {len(tokens)} graduated tokens from pump.fun")
+            logger.info(f"Got {len(txs)} transactions from Helius")
             
-            for token in tokens:
-                mint = token.get("mint")
-                if not mint:
-                    continue
-                
-                if mint in existing_mints:
-                    continue
-                
-                # Token data already includes creator and metadata
-                creator = token.get("creator")
-                
-                # Save token as graduated
-                token["complete"] = True
-                token["is_graduated"] = True
-                token["graduated_at"] = token.get("complete_timestamp") or datetime.utcnow().isoformat()
-                
-                DatabaseOps.save_token(token)
-                
-                if creator:
-                    DatabaseOps.update_developer_stats(creator)
-                
-                existing_mints.add(mint)
-                total_loaded += 1
-                
-                if total_loaded % 20 == 0:
-                    logger.info(f"Loaded {total_loaded} graduated tokens...")
+            # Debug first transaction on first page
+            if page == 0 and txs:
+                first_tx = txs[0]
+                logger.info(f"First tx keys: {list(first_tx.keys())}")
+                logger.info(f"First tx type: {first_tx.get('type')}")
             
-            # Move to next page
-            offset += limit
+            page_tokens = 0
+            for tx in txs:
+                # Find pump token in transaction
+                token_mint = helius_client.find_pump_token_in_transaction(tx)
+                
+                if token_mint and token_mint not in existing_mints and token_mint not in unique_tokens:
+                    unique_tokens.add(token_mint)
+                    
+                    # Save token with minimal data (Helius-only, no pump.fun)
+                    timestamp = tx.get("timestamp", int(time.time()))
+                    token_data = {
+                        "mint": token_mint,
+                        "name": f"Token {token_mint[:8]}...",  # Placeholder
+                        "symbol": "???",  # Will be enriched later
+                        "creator": None,  # Will be enriched later
+                        "complete": True,
+                        "is_graduated": True,
+                        "graduated_at": datetime.fromtimestamp(timestamp).isoformat()
+                    }
+                    
+                    DatabaseOps.save_token(token_data)
+                    total_loaded += 1
+                    page_tokens += 1
+                    
+                    if total_loaded % 50 == 0:
+                        logger.info(f"Loaded {total_loaded} migrated tokens...")
             
-            # Rate limiting - 1 second between requests
-            await asyncio.sleep(1)
+            logger.info(f"Page {page}: Found {page_tokens} new pump tokens")
+            
+            # Get cursor for next page
+            if txs:
+                before = txs[-1].get("signature")
+            
+            # Rate limiting
+            await asyncio.sleep(0.3)
             
         except Exception as e:
-            logger.error(f"Error loading graduated tokens: {e}")
-            # Wait and retry on error
-            await asyncio.sleep(60)
+            logger.error(f"Error loading historical migrations: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await asyncio.sleep(5)
             continue
     
-    logger.info(f"Historical load complete: {total_loaded} graduated tokens loaded")
+    logger.info(f"Historical load complete: {total_loaded} migrated tokens loaded")
+    logger.info(f"Note: Token metadata will be enriched when pump.fun API becomes available")
+
+
+# Background task to enrich token data from pump.fun
+async def enrich_token_data():
+    """Try to enrich tokens that have no creator data"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Run every 5 minutes
+            
+            conn = DatabaseOps.get_connection()
+            cursor = conn.cursor()
+            DatabaseOps.execute(cursor, 
+                'SELECT mint FROM tokens WHERE creator_wallet IS NULL AND is_graduated = 1 LIMIT 10'
+            )
+            tokens_to_enrich = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            
+            if not tokens_to_enrich:
+                continue
+            
+            logger.info(f"Attempting to enrich {len(tokens_to_enrich)} tokens...")
+            
+            for mint in tokens_to_enrich:
+                token_info = pumpfun_client.get_token_info(mint)
+                if token_info and token_info.get("creator"):
+                    # Update token with full data
+                    token_info["complete"] = True
+                    token_info["is_graduated"] = True
+                    DatabaseOps.save_token(token_info)
+                    
+                    creator = token_info.get("creator")
+                    if creator:
+                        DatabaseOps.update_developer_stats(creator)
+                    
+                    logger.info(f"Enriched token {mint[:8]}... with creator {creator[:8] if creator else 'N/A'}")
+                
+                await asyncio.sleep(2)  # Rate limit
+                
+        except Exception as e:
+            logger.error(f"Error enriching tokens: {e}")
+            await asyncio.sleep(60)
 
 
 # WebSocket manager for client connections
@@ -1017,6 +1070,10 @@ async def lifespan(app: FastAPI):
     # Load historical migrations (only on fresh database)
     logger.info("Scheduling historical migrations load...")
     asyncio.create_task(load_historical_migrations())
+    
+    # Start background enrichment task (tries to get data from pump.fun when available)
+    logger.info("Starting token enrichment background task...")
+    asyncio.create_task(enrich_token_data())
     
     yield
     logger.info("Shutting down...")
