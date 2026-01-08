@@ -835,16 +835,19 @@ async def extract_and_save_migration(tx_data: Dict, signature: str):
 # Historical migration loader
 async def load_historical_migrations():
     """Load historical migrations from Helius API"""
-    logger.info("Loading historical migrations...")
+    logger.info("=== Starting historical migrations load ===")
     
     # Load existing tokens to avoid duplicates
-    conn = DatabaseOps.get_connection()
-    cursor = conn.cursor()
-    DatabaseOps.execute(cursor, 'SELECT mint FROM tokens WHERE is_graduated = 1')
-    existing_mints = set(row[0] for row in cursor.fetchall())
-    conn.close()
-    
-    logger.info(f"Found {len(existing_mints)} existing migrated tokens")
+    try:
+        conn = DatabaseOps.get_connection()
+        cursor = conn.cursor()
+        DatabaseOps.execute(cursor, 'SELECT mint FROM tokens WHERE is_graduated = 1')
+        existing_mints = set(row[0] for row in cursor.fetchall())
+        conn.close()
+        logger.info(f"Found {len(existing_mints)} existing migrated tokens in DB")
+    except Exception as e:
+        logger.error(f"Error loading existing tokens: {e}")
+        existing_mints = set()
     
     # If we already have tokens, skip historical load
     if len(existing_mints) > 100:
@@ -852,12 +855,14 @@ async def load_historical_migrations():
         return
     
     # Fetch recent transactions from PumpSwap program
+    logger.info(f"Starting Helius API requests for program: {PUMPSWAP_PROGRAM}")
     before = None
     total_loaded = 0
     max_pages = 50
     
     for page in range(max_pages):
         try:
+            logger.info(f"Requesting page {page} from Helius API...")
             txs = helius_client.get_transactions_for_address(PUMPSWAP_PROGRAM, before=before, limit=100)
             
             if not txs:
@@ -944,14 +949,16 @@ manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_database()
+    logger.info("Background tasks started")
     
     # Start Helius WebSocket listener
+    logger.info(f"Starting Helius WebSocket listener for PumpSwap: {PUMPSWAP_PROGRAM}")
     asyncio.create_task(helius_websocket_listener())
     
     # Load historical migrations (only on fresh database)
+    logger.info("Scheduling historical migrations load...")
     asyncio.create_task(load_historical_migrations())
     
-    logger.info("Background tasks started")
     yield
     logger.info("Shutting down...")
 
