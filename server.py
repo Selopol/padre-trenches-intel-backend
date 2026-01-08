@@ -315,7 +315,14 @@ class DatabaseOps:
                     'last_migration_at=EXCLUDED.last_migration_at, last_token_launch_at=EXCLUDED.last_token_launch_at, ' + \
                     'updated_at=CURRENT_TIMESTAMP'
         if params:
-            cursor.execute(query, params)
+            try:
+                cursor.execute(query, params)
+            except IndexError as e:
+                logger.error(f"IndexError in execute: {e}")
+                logger.error(f"Query placeholders: {query.count('%s' if USE_POSTGRES else '?')}")
+                logger.error(f"Params count: {len(params) if isinstance(params, (list, tuple)) else 1}")
+                logger.error(f"Query preview: {query[:200]}...")
+                raise
         else:
             cursor.execute(query)
         return cursor
