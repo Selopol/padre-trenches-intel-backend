@@ -213,30 +213,35 @@ class DatabaseOps:
     
     @staticmethod
     def save_token(token_data: Dict):
-        conn = DatabaseOps.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO tokens 
-            (mint, name, symbol, creator_wallet, twitter_link, telegram_link, website_link, 
-             description, image_uri, is_graduated, created_at, graduated_at, market_cap, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (
-            token_data.get("mint"),
-            token_data.get("name"),
-            token_data.get("symbol"),
-            token_data.get("creator"),
-            token_data.get("twitter"),
-            token_data.get("telegram"),
-            token_data.get("website"),
-            token_data.get("description"),
-            token_data.get("image_uri"),
-            token_data.get("complete", False),
-            datetime.fromtimestamp(token_data.get("created_timestamp", 0) / 1000).isoformat() if token_data.get("created_timestamp") else None,
-            datetime.fromtimestamp(token_data.get("last_trade_timestamp", 0) / 1000).isoformat() if token_data.get("complete") and token_data.get("last_trade_timestamp") else None,
-            token_data.get("market_cap")
-        ))
-        conn.commit()
-        conn.close()
+        try:
+            conn = DatabaseOps.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO tokens 
+                (mint, name, symbol, creator_wallet, twitter_link, telegram_link, website_link, 
+                 description, image_uri, is_graduated, created_at, graduated_at, market_cap, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (
+                token_data.get("mint"),
+                token_data.get("name"),
+                token_data.get("symbol"),
+                token_data.get("creator"),
+                token_data.get("twitter"),
+                token_data.get("telegram"),
+                token_data.get("website"),
+                token_data.get("description"),
+                token_data.get("image_uri"),
+                token_data.get("complete", False),
+                datetime.fromtimestamp(token_data.get("created_timestamp", 0) / 1000).isoformat() if token_data.get("created_timestamp") else None,
+                datetime.fromtimestamp(token_data.get("last_trade_timestamp", 0) / 1000).isoformat() if token_data.get("complete") and token_data.get("last_trade_timestamp") else None,
+                token_data.get("market_cap")
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error saving token {token_data.get('mint', 'unknown')}: {e}")
+            if 'conn' in locals():
+                conn.close()
     
     @staticmethod
     def get_token(mint: str) -> Optional[Dict]:
@@ -273,8 +278,10 @@ class DatabaseOps:
         all_user_tokens = pumpfun_client.fetch_user_coins(wallet, limit=1000)
         
         # Save all tokens to database (including non-migrated)
-        for token in all_user_tokens:
-            DatabaseOps.save_token(token)
+        if all_user_tokens and isinstance(all_user_tokens, list):
+            for token in all_user_tokens:
+                if isinstance(token, dict):
+                    DatabaseOps.save_token(token)
         
         # Now count from database
         cursor.execute('''
@@ -475,6 +482,11 @@ async def scan_pump_tokens():
                 logger.info(f"Regular scan: {len(migrated_coins)} migrated coins")
             
             for coin in migrated_coins:
+                # Skip if coin is not a dict (API error)
+                if not isinstance(coin, dict):
+                    logger.warning(f"Skipping invalid coin data: {type(coin)}")
+                    continue
+                
                 mint = coin.get("mint")
                 if not mint or mint in seen_tokens:
                     continue
