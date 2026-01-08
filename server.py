@@ -263,6 +263,71 @@ class PumpFunClient:
         except Exception as e:
             logger.error(f"Error fetching user coins for {wallet}: {e}")
             return {"coins": [], "count": 0}
+    
+    def fetch_with_retry(self, url: str, params: Dict = None, max_retries: int = 5) -> Optional[Dict]:
+        """Fetch URL with retry logic for rate limiting"""
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, params=params, timeout=30)
+                
+                if response.status_code == 200:
+                    return response.json()
+                
+                if response.status_code in [429, 503, 530, 1016]:  # Rate limit / Cloudflare
+                    wait_time = 60 * (attempt + 1)  # 60s, 120s, 180s...
+                    logger.warning(f"Rate limited ({response.status_code}), waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                
+                logger.warning(f"API returned {response.status_code} for {url}")
+                return None
+                
+            except Exception as e:
+                logger.error(f"Request error (attempt {attempt+1}): {e}")
+                time.sleep(10)
+        
+        return None
+    
+    def get_graduated_tokens(self, limit: int = 50, offset: int = 0) -> List[Dict]:
+        """Get graduated (completed) tokens from pump.fun API"""
+        try:
+            # Use completed=true filter to get only graduated tokens
+            params = {
+                "limit": limit,
+                "offset": offset,
+                "sort": "last_trade_timestamp",
+                "order": "DESC",
+                "includeNsfw": "true",
+                "completed": "true"  # Only graduated tokens
+            }
+            
+            data = self.fetch_with_retry(f"{self.base_url}/coins", params=params)
+            
+            if data and isinstance(data, list):
+                return data
+            elif data and isinstance(data, dict):
+                return data.get("coins", data.get("items", []))
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error fetching graduated tokens: {e}")
+            return []
+    
+    def get_king_of_hill_tokens(self) -> List[Dict]:
+        """Get king-of-the-hill tokens (recently graduated)"""
+        try:
+            data = self.fetch_with_retry(
+                f"{self.base_url}/coins/king-of-the-hill",
+                params={"includeNsfw": "true"}
+            )
+            
+            if data and isinstance(data, list):
+                return data
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error fetching king-of-hill tokens: {e}")
+            return []
 
 
 class HeliusClient:
@@ -834,7 +899,7 @@ async def extract_and_save_migration(tx_data: Dict, signature: str):
 
 # Historical migration loader
 async def load_historical_migrations():
-    """Load historical migrations from Helius API"""
+    """Load historical migrations from pump.fun graduated tokens API"""
     logger.info("=== Starting historical migrations load ===")
     
     # Load existing tokens to avoid duplicates
@@ -854,72 +919,66 @@ async def load_historical_migrations():
         logger.info("Skipping historical load - database already populated")
         return
     
-    # Fetch recent transactions from PumpSwap program
-    logger.info(f"Starting Helius API requests for program: {PUMPSWAP_PROGRAM}")
-    before = None
+    # Use pump.fun API to get graduated tokens directly
+    logger.info("Fetching graduated tokens from pump.fun API...")
     total_loaded = 0
-    max_pages = 50
+    offset = 0
+    limit = 50
+    max_tokens = 1000  # Limit to prevent too long loading
     
-    for page in range(max_pages):
+    while total_loaded < max_tokens:
         try:
-            logger.info(f"Requesting page {page} from Helius API...")
-            txs = helius_client.get_transactions_for_address(PUMPSWAP_PROGRAM, before=before, limit=100)
+            logger.info(f"Requesting graduated tokens: offset={offset}, limit={limit}")
             
-            if not txs:
-                logger.info(f"No more transactions at page {page}")
+            # Get graduated tokens from pump.fun
+            tokens = pumpfun_client.get_graduated_tokens(limit=limit, offset=offset)
+            
+            if not tokens:
+                logger.info(f"No more graduated tokens at offset {offset}")
                 break
             
-            # Debug: Log first transaction structure on first page
-            if page == 0 and txs:
-                first_tx = txs[0]
-                logger.info(f"First tx type: {first_tx.get('type')}, has tokenTransfers: {'tokenTransfers' in first_tx}")
-                logger.info(f"First tx keys: {list(first_tx.keys())[:10]}")
+            logger.info(f"Got {len(tokens)} graduated tokens from pump.fun")
             
-            pump_tokens_found = 0
-            for tx in txs:
-                signature = tx.get("signature")
+            for token in tokens:
+                mint = token.get("mint")
+                if not mint:
+                    continue
                 
-                # Parse transaction for pump tokens
-                migration = helius_client.parse_migration_transaction(tx)
-                if migration:
-                    pump_tokens_found += 1
-                    token_mint = migration["token_mint"]
-                    
-                    if token_mint in existing_mints:
-                        continue
-                    
-                    # Get token info
-                    token_info = pumpfun_client.get_token_info(token_mint)
-                    if token_info:
-                        token_info["complete"] = True
-                        token_info["graduated_at"] = datetime.fromtimestamp(
-                            migration.get("timestamp", time.time())
-                        ).isoformat()
-                        DatabaseOps.save_token(token_info)
-                        
-                        creator = token_info.get("creator")
-                        if creator:
-                            DatabaseOps.update_developer_stats(creator)
-                        
-                        existing_mints.add(token_mint)
-                        total_loaded += 1
-                        
-                        if total_loaded % 10 == 0:
-                            logger.info(f"Loaded {total_loaded} historical migrations...")
+                if mint in existing_mints:
+                    continue
+                
+                # Token data already includes creator and metadata
+                creator = token.get("creator")
+                
+                # Save token as graduated
+                token["complete"] = True
+                token["is_graduated"] = True
+                token["graduated_at"] = token.get("complete_timestamp") or datetime.utcnow().isoformat()
+                
+                DatabaseOps.save_token(token)
+                
+                if creator:
+                    DatabaseOps.update_developer_stats(creator)
+                
+                existing_mints.add(mint)
+                total_loaded += 1
+                
+                if total_loaded % 20 == 0:
+                    logger.info(f"Loaded {total_loaded} graduated tokens...")
             
-            logger.info(f"Page {page}: Found {pump_tokens_found} pump tokens in {len(txs)} transactions")
+            # Move to next page
+            offset += limit
             
-            # Get cursor for next page
-            if txs:
-                before = txs[-1].get("signature")
-            
-            await asyncio.sleep(0.5)  # Rate limiting
+            # Rate limiting - 1 second between requests
+            await asyncio.sleep(1)
             
         except Exception as e:
-            logger.error(f"Error loading historical migrations: {e}")
-            break
+            logger.error(f"Error loading graduated tokens: {e}")
+            # Wait and retry on error
+            await asyncio.sleep(60)
+            continue
     
-    logger.info(f"Historical load complete: {total_loaded} migrations loaded")
+    logger.info(f"Historical load complete: {total_loaded} graduated tokens loaded")
 
 
 # WebSocket manager for client connections
