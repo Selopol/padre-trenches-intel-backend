@@ -1114,11 +1114,26 @@ async def enrich_token_data():
                     creator = moralis_client.get_token_creator(mint)
                     if creator:
                         moralis_meta = moralis_client.get_token_metadata(mint)
+                        
+                        # Extract links from Moralis
+                        links = moralis_meta.get("links", {}) if moralis_meta else {}
+                        twitter_link = links.get("twitter")
+                        website_link = links.get("website")
+                        
+                        # Check for community link
+                        community_link = None
+                        if website_link and "/i/communities/" in website_link:
+                            community_link = website_link
+                        elif twitter_link and "/i/communities/" in twitter_link:
+                            community_link = twitter_link
+                        
                         token_info = {
                             "mint": mint,
                             "name": moralis_meta.get("name") if moralis_meta else f"Token {mint[:8]}...",
                             "symbol": moralis_meta.get("symbol") if moralis_meta else "???",
                             "creator": creator,
+                            "twitter": community_link or twitter_link,
+                            "website": website_link if not community_link else None,
                             "complete": True,
                             "is_graduated": True
                         }
@@ -1298,18 +1313,60 @@ async def force_enrich_tokens(limit: int = 100):
                 
                 if creator:
                     moralis_meta = moralis_client.get_token_metadata(mint)
+                    
+                    # Extract links from Moralis metadata
+                    links = moralis_meta.get("links", {}) if moralis_meta else {}
+                    twitter_link = links.get("twitter")
+                    website_link = links.get("website")
+                    
+                    # Check if website is actually a community link
+                    community_link = None
+                    if website_link and "/i/communities/" in website_link:
+                        community_link = website_link
+                    elif twitter_link and "/i/communities/" in twitter_link:
+                        community_link = twitter_link
+                    
                     token_info = {
                         "mint": mint,
                         "name": moralis_meta.get("name") if moralis_meta else f"Token {mint[:8]}...",
                         "symbol": moralis_meta.get("symbol") if moralis_meta else "???",
                         "creator": creator,
+                        "twitter": community_link or twitter_link,  # Prefer community link
+                        "website": website_link if not community_link else None,
                         "complete": True,
                         "is_graduated": True
                     }
                     DatabaseOps.save_token(token_info)
+                    
+                    # Try to get twitter handle from community
+                    twitter_handle = None
+                    if community_link:
+                        community_id = twitter_client.extract_community_id(community_link)
+                        if community_id:
+                            twitter_handle = twitter_client.get_community_admin(community_id)
+                            if twitter_handle:
+                                logger.info(f"[Force-Enrich] Got twitter @{twitter_handle} from community for {mint[:8]}...")
+                    
+                    # If no community, try to extract from twitter link
+                    if not twitter_handle and twitter_link:
+                        twitter_handle = extract_twitter_handle(twitter_link)
+                    
+                    # Update developer stats (this will also try to get twitter from DB)
                     DatabaseOps.update_developer_stats(creator)
+                    
+                    # If we found twitter handle, update developer directly
+                    if twitter_handle:
+                        conn = DatabaseOps.get_connection()
+                        cursor = conn.cursor()
+                        DatabaseOps.execute(cursor, 
+                            'UPDATE developers SET twitter_handle = ? WHERE wallet = ?',
+                            (twitter_handle, creator)
+                        )
+                        conn.commit()
+                        conn.close()
+                    
                     enriched += 1
-                    logger.info(f"[Force-Enrich] {mint[:8]}... -> {creator[:8]}...")
+                    logger.info(f"[Force-Enrich] {mint[:8]}... -> {creator[:8]}... (twitter: @{twitter_handle or 'N/A'})")
                 else:
                     failed += 1
                 
