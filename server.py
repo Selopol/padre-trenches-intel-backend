@@ -857,16 +857,19 @@ async def get_top_devs_detailed(limit: int = 50, by: str = "percentage"):
     conn = DatabaseOps.get_connection()
     cursor = conn.cursor()
     
-    # Get latest token for each wallet using window function
+    # Get latest token for each wallet using standard SQL
     placeholders = ','.join(['?' for _ in wallets])
     query = f'''
-        SELECT DISTINCT ON (creator_wallet) 
-            mint, name, symbol, creator_wallet, twitter_link, telegram_link, 
-            website_link, description, image_uri, is_graduated, created_at, 
-            graduated_at, market_cap
-        FROM tokens
-        WHERE creator_wallet IN ({placeholders})
-        ORDER BY creator_wallet, created_at DESC
+        SELECT t.mint, t.name, t.symbol, t.creator_wallet, t.twitter_link, t.telegram_link, 
+               t.website_link, t.description, t.image_uri, t.is_graduated, t.created_at, 
+               t.graduated_at, t.market_cap
+        FROM tokens t
+        INNER JOIN (
+            SELECT creator_wallet, MAX(created_at) as max_created
+            FROM tokens
+            WHERE creator_wallet IN ({placeholders})
+            GROUP BY creator_wallet
+        ) latest ON t.creator_wallet = latest.creator_wallet AND t.created_at = latest.max_created
     '''
     
     DatabaseOps.execute(cursor, query, tuple(wallets))
