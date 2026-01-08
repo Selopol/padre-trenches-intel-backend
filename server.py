@@ -285,10 +285,16 @@ class DatabaseOps:
     def execute(cursor, query, params=None):
         """Execute query with automatic placeholder conversion for PostgreSQL"""
         if USE_POSTGRES:
+            # Convert SQLite BOOLEAN values to PostgreSQL first
+            query = query.replace('= 0', '= FALSE').replace('= 1', '= TRUE')
+            # Protect % in LIKE clauses by temporarily replacing them
+            query = query.replace("'%", "'<PERCENT>")
+            query = query.replace("%'", "<PERCENT>'")
             # Convert SQLite ? placeholders to PostgreSQL %s
             query = query.replace('?', '%s')
-            # Convert SQLite BOOLEAN values to PostgreSQL
-            query = query.replace('= 0', '= FALSE').replace('= 1', '= TRUE')
+            # Restore % in LIKE clauses
+            query = query.replace("'<PERCENT>", "'%")
+            query = query.replace("<PERCENT>'", "%'")
             # Convert INSERT OR REPLACE to PostgreSQL UPSERT
             if 'INSERT OR REPLACE INTO tokens' in query:
                 query = query.replace('INSERT OR REPLACE INTO tokens', 
