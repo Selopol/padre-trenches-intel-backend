@@ -844,18 +844,59 @@ async def get_top_devs_by_count(limit: int = 50):
 
 @app.get("/api/top-devs/detailed")
 async def get_top_devs_detailed(limit: int = 50, by: str = "percentage"):
-    """Get top developers with their latest token info"""
+    """Get top developers with their latest token info (optimized)"""
     if by == "count":
         devs = DatabaseOps.get_top_devs_by_count(limit)
     else:
         devs = DatabaseOps.get_top_devs_by_percentage(limit)
     
-    # Enrich with latest token info
+    # Get all wallets
+    wallets = [dev["wallet"] for dev in devs]
+    
+    # Fetch latest token for each wallet in a single query
+    conn = DatabaseOps.get_connection()
+    cursor = conn.cursor()
+    
+    # Get latest token for each wallet using window function
+    placeholders = ','.join(['?' for _ in wallets])
+    query = f'''
+        SELECT DISTINCT ON (creator_wallet) 
+            mint, name, symbol, creator_wallet, twitter_link, telegram_link, 
+            website_link, description, image_uri, is_graduated, created_at, 
+            graduated_at, market_cap
+        FROM tokens
+        WHERE creator_wallet IN ({placeholders})
+        ORDER BY creator_wallet, created_at DESC
+    '''
+    
+    DatabaseOps.execute(cursor, query, tuple(wallets))
+    token_rows = cursor.fetchall()
+    conn.close()
+    
+    # Build wallet -> token map
+    token_map = {}
+    for row in token_rows:
+        wallet = row[3]
+        if wallet not in token_map:
+            token_map[wallet] = {
+                "mint": row[0],
+                "name": row[1],
+                "symbol": row[2],
+                "creator_wallet": row[3],
+                "twitter_link": row[4],
+                "telegram_link": row[5],
+                "website_link": row[6],
+                "description": row[7],
+                "image_uri": row[8],
+                "is_graduated": bool(row[9]),
+                "created_at": row[10],
+                "graduated_at": row[11],
+                "market_cap": row[12]
+            }
+    
+    # Enrich devs with latest token
     detailed_devs = []
     for dev in devs:
-        tokens = DatabaseOps.get_dev_tokens(dev["wallet"], limit=1)
-        latest_token = tokens[0] if tokens else None
-        
         detailed_devs.append({
             "wallet": dev["wallet"],
             "twitter_handle": dev["twitter_handle"],
@@ -864,7 +905,7 @@ async def get_top_devs_detailed(limit: int = 50, by: str = "percentage"):
             "migration_percentage": dev["migration_percentage"],
             "last_migration_at": dev["last_migration_at"],
             "last_token_launch_at": dev["last_token_launch_at"],
-            "latest_token": latest_token
+            "latest_token": token_map.get(dev["wallet"])
         })
     
     return {
