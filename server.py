@@ -374,70 +374,81 @@ class DatabaseOps:
     @staticmethod
     def update_developer_stats(wallet: str):
         """Update developer statistics by fetching ALL tokens from Pump.fun"""
-        conn = DatabaseOps.get_connection()
-        cursor = conn.cursor()
+        try:
+            conn = DatabaseOps.get_connection()
+            cursor = conn.cursor()
         
-        # Fetch ALL tokens from this developer via Pump.fun API
-        api_response = pumpfun_client.fetch_user_coins(wallet, limit=1000)
-        
-        # Save all tokens to database (including non-migrated)
-        if api_response and isinstance(api_response, dict):
-            coins = api_response.get("coins", [])
-            for token in coins:
-                if isinstance(token, dict):
-                    DatabaseOps.save_token(token)
-        
-        # Use the count from API response (this is the TOTAL count)
-        total_tokens = api_response.get("count", 0) if isinstance(api_response, dict) else 0
-        
-        # Count graduated tokens from database
-        DatabaseOps.execute(cursor, '''
-            SELECT COUNT(*) FROM tokens 
-            WHERE creator_wallet = ? AND is_graduated = 1
-        ''', (wallet,))
-        result = cursor.fetchone()
-        graduated_tokens = result[0] if result else 0
-        migration_percentage = (graduated_tokens / total_tokens * 100) if total_tokens > 0 else 0
-        
-        # Get last migration time
-        DatabaseOps.execute(cursor, '''
-            SELECT MAX(graduated_at) FROM tokens 
-            WHERE creator_wallet = ? AND is_graduated = 1
-        ''', (wallet,))
-        result = cursor.fetchone()
-        last_migration = result[0] if result else None
-        
-        # Get last token launch time
-        DatabaseOps.execute(cursor, '''
-            SELECT MAX(created_at) FROM tokens WHERE creator_wallet = ?
-        ''', (wallet,))
-        result = cursor.fetchone()
-        last_launch = result[0] if result else None
-        
-        # Get twitter handle ONLY from community links (ignore tweets)
-        DatabaseOps.execute(cursor, '''
-            SELECT twitter_link FROM tokens 
-            WHERE creator_wallet = ? AND twitter_link LIKE '%/i/communities/%' LIMIT 1
-        ''', (wallet,))
-        twitter_result = cursor.fetchone()
-        twitter_handle = None
-        if twitter_result:
-            twitter_link = twitter_result[0]
-            # Extract community admin via twitterapi.io
-            community_id = twitter_client.extract_community_id(twitter_link)
-            if community_id:
-                twitter_handle = twitter_client.get_community_admin(community_id)
-        
-        DatabaseOps.execute(cursor, '''
-            INSERT OR REPLACE INTO developers 
-            (wallet, twitter_handle, total_tokens, graduated_tokens, migration_percentage, 
-             last_migration_at, last_token_launch_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (wallet, twitter_handle, total_tokens, graduated_tokens, migration_percentage, 
-              last_migration, last_launch))
-        
-        conn.commit()
-        conn.close()
+            # Fetch ALL tokens from this developer via Pump.fun API
+            api_response = pumpfun_client.fetch_user_coins(wallet, limit=1000)
+            
+            # Save all tokens to database (including non-migrated)
+            if api_response and isinstance(api_response, dict):
+                coins = api_response.get("coins", [])
+                for token in coins:
+                    if isinstance(token, dict):
+                        DatabaseOps.save_token(token)
+            
+            # Use the count from API response (this is the TOTAL count)
+            total_tokens = api_response.get("count", 0) if isinstance(api_response, dict) else 0
+            
+            # Count graduated tokens from database
+            DatabaseOps.execute(cursor, '''
+                SELECT COUNT(*) FROM tokens 
+                WHERE creator_wallet = ? AND is_graduated = 1
+            ''', (wallet,))
+            result = cursor.fetchone()
+            graduated_tokens = result[0] if result else 0
+            migration_percentage = (graduated_tokens / total_tokens * 100) if total_tokens > 0 else 0
+            
+            # Get last migration time
+            DatabaseOps.execute(cursor, '''
+                SELECT MAX(graduated_at) FROM tokens 
+                WHERE creator_wallet = ? AND is_graduated = 1
+            ''', (wallet,))
+            result = cursor.fetchone()
+            last_migration = result[0] if result else None
+            
+            # Get last token launch time
+            DatabaseOps.execute(cursor, '''
+                SELECT MAX(created_at) FROM tokens WHERE creator_wallet = ?
+            ''', (wallet,))
+            result = cursor.fetchone()
+            last_launch = result[0] if result else None
+            
+            # Get twitter handle ONLY from community links (ignore tweets)
+            DatabaseOps.execute(cursor, '''
+                SELECT twitter_link FROM tokens 
+                WHERE creator_wallet = ? AND twitter_link LIKE '%/i/communities/%' LIMIT 1
+            ''', (wallet,))
+            twitter_result = cursor.fetchone()
+            twitter_handle = None
+            if twitter_result:
+                twitter_link = twitter_result[0]
+                # Extract community admin via twitterapi.io
+                community_id = twitter_client.extract_community_id(twitter_link)
+                if community_id:
+                    twitter_handle = twitter_client.get_community_admin(community_id)
+            
+            DatabaseOps.execute(cursor, '''
+                INSERT OR REPLACE INTO developers 
+                (wallet, twitter_handle, total_tokens, graduated_tokens, migration_percentage, 
+                 last_migration_at, last_token_launch_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (wallet, twitter_handle, total_tokens, graduated_tokens, migration_percentage, 
+                  last_migration, last_launch))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error updating developer stats for {wallet[:8]}...: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            import traceback
+            logger.error(traceback.format_exc())
+            if 'conn' in locals():
+                try:
+                    conn.close()
+                except:
+                    pass
     
     @staticmethod
     def get_developer(wallet: str) -> Optional[Dict]:
