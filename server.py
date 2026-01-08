@@ -894,75 +894,15 @@ async def get_top_devs_by_count(limit: int = 50):
 
 @app.get("/api/top-devs/detailed")
 async def get_top_devs_detailed(limit: int = 50, by: str = "percentage"):
-    """Get top developers with their latest token info (optimized)"""
+    """Get top developers - simplified version without token details for speed"""
     if by == "count":
         devs = DatabaseOps.get_top_devs_by_count(limit)
     else:
         devs = DatabaseOps.get_top_devs_by_percentage(limit)
     
-    # Get all wallets
-    wallets = [dev["wallet"] for dev in devs]
-    
-    # Fetch latest token for each wallet in a single query
-    conn = DatabaseOps.get_connection()
-    cursor = conn.cursor()
-    
-    # Get latest token for each wallet using standard SQL
-    placeholders = ','.join(['?' for _ in wallets])
-    query = f'''
-        SELECT t.mint, t.name, t.symbol, t.creator_wallet, t.twitter_link, t.telegram_link, 
-               t.website_link, t.description, t.image_uri, t.is_graduated, t.created_at, 
-               t.graduated_at, t.market_cap
-        FROM tokens t
-        INNER JOIN (
-            SELECT creator_wallet, MAX(created_at) as max_created
-            FROM tokens
-            WHERE creator_wallet IN ({placeholders})
-            GROUP BY creator_wallet
-        ) latest ON t.creator_wallet = latest.creator_wallet AND t.created_at = latest.max_created
-    '''
-    
-    DatabaseOps.execute(cursor, query, tuple(wallets))
-    token_rows = cursor.fetchall()
-    conn.close()
-    
-    # Build wallet -> token map
-    token_map = {}
-    for row in token_rows:
-        wallet = row[3]
-        if wallet not in token_map:
-            token_map[wallet] = {
-                "mint": row[0],
-                "name": row[1],
-                "symbol": row[2],
-                "creator_wallet": row[3],
-                "twitter_link": row[4],
-                "telegram_link": row[5],
-                "website_link": row[6],
-                "description": row[7],
-                "image_uri": row[8],
-                "is_graduated": bool(row[9]),
-                "created_at": row[10],
-                "graduated_at": row[11],
-                "market_cap": row[12]
-            }
-    
-    # Enrich devs with latest token
-    detailed_devs = []
-    for dev in devs:
-        detailed_devs.append({
-            "wallet": dev["wallet"],
-            "twitter_handle": dev["twitter_handle"],
-            "total_tokens": dev["total_tokens"],
-            "migrated_tokens": dev["migrated_tokens"],
-            "migration_percentage": dev["migration_percentage"],
-            "last_migration_at": dev["last_migration_at"],
-            "last_token_launch_at": dev["last_token_launch_at"],
-            "latest_token": token_map.get(dev["wallet"])
-        })
-    
+    # Return devs directly without heavy token lookup
     return {
-        "devs": detailed_devs,
+        "devs": devs,
         "updated_at": datetime.utcnow().isoformat()
     }
 
