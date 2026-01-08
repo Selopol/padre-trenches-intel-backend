@@ -581,19 +581,28 @@ async def scan_pump_tokens():
     """Background task to scan Pump.fun tokens"""
     logger.info("Starting Pump.fun token scanner...")
     
-    # Track seen tokens to avoid duplicates
-    seen_tokens = set()
+    # Load existing token mints from database to avoid re-scanning
+    def load_existing_tokens():
+        conn = DatabaseOps.get_connection()
+        cursor = conn.cursor()
+        DatabaseOps.execute(cursor, 'SELECT mint FROM tokens')
+        rows = cursor.fetchall()
+        conn.close()
+        return set(row[0] for row in rows)
     
-    # First run: fetch ALL migrated tokens from last month
-    first_run = True
+    seen_tokens = load_existing_tokens()
+    logger.info(f"Loaded {len(seen_tokens)} existing tokens from database")
+    
+    # Skip full scan if database already has tokens (restart scenario)
+    first_run = len(seen_tokens) == 0
     
     while True:
         try:
             migrated_coins = []
             
             if first_run:
-                # Fetch ALL migrated tokens with pagination
-                logger.info("First run: fetching ALL migrated tokens...")
+                # Fetch ALL migrated tokens with pagination (only on fresh database)
+                logger.info("First run (empty database): fetching ALL migrated tokens...")
                 offset = 0
                 batch_size = 50  # Pump.fun API returns max 50
                 max_pages = 200  # Safety limit (50 * 200 = 10,000 tokens max)
@@ -619,9 +628,10 @@ async def scan_pump_tokens():
                 first_run = False
                 logger.info(f"First run complete: {len(migrated_coins)} total migrated tokens fetched")
             else:
-                # Regular scans: just fetch recent 50
+                # Regular scans: just fetch recent 50 (checks for new tokens)
                 migrated_coins = pumpfun_client.fetch_migrated_coins(limit=50)
-                logger.info(f"Regular scan: {len(migrated_coins)} migrated coins")
+                new_count = sum(1 for c in migrated_coins if isinstance(c, dict) and c.get('mint') not in seen_tokens)
+                logger.info(f"Regular scan: {len(migrated_coins)} migrated coins, {new_count} new")
             
             for coin in migrated_coins:
                 # Skip if coin is not a dict (API error)
