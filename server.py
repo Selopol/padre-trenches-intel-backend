@@ -120,8 +120,10 @@ class PumpFunClient:
         """Fetch only migrated (graduated) coins"""
         return self.fetch_coins(offset=0, limit=limit, complete=True)
     
-    def fetch_user_coins(self, address: str, limit: int = 1000) -> List[Dict]:
-        """Fetch all coins created by a specific user"""
+    def fetch_user_coins(self, address: str, limit: int = 1000) -> Dict:
+        """Fetch all coins created by a specific user
+        Returns: {coins: [...], count: total_count}
+        """
         params = {
             "offset": 0,
             "limit": limit,
@@ -135,12 +137,16 @@ class PumpFunClient:
                 timeout=30
             )
             if response.status_code == 404:
-                return []
+                return {"coins": [], "count": 0}
             response.raise_for_status()
-            return response.json() or []
+            data = response.json()
+            # API returns {coins: [...], count: total_count}
+            if isinstance(data, dict):
+                return data
+            return {"coins": [], "count": 0}
         except Exception as e:
             logger.error(f"Error fetching user coins for {address}: {e}")
-            return []
+            return {"coins": [], "count": 0}
 
 # Twitter API Client
 class TwitterClient:
@@ -275,22 +281,24 @@ class DatabaseOps:
         cursor = conn.cursor()
         
         # Fetch ALL tokens from this developer via Pump.fun API
-        all_user_tokens = pumpfun_client.fetch_user_coins(wallet, limit=1000)
+        api_response = pumpfun_client.fetch_user_coins(wallet, limit=1000)
         
         # Save all tokens to database (including non-migrated)
-        if all_user_tokens and isinstance(all_user_tokens, list):
-            for token in all_user_tokens:
+        if api_response and isinstance(api_response, dict):
+            coins = api_response.get("coins", [])
+            for token in coins:
                 if isinstance(token, dict):
                     DatabaseOps.save_token(token)
         
-        # Now count from database
+        # Use the count from API response (this is the TOTAL count)
+        total_tokens = api_response.get("count", 0) if isinstance(api_response, dict) else 0
+        
+        # Count graduated tokens from database
         cursor.execute('''
-            SELECT COUNT(*), SUM(CASE WHEN is_graduated = 1 THEN 1 ELSE 0 END) 
-            FROM tokens WHERE creator_wallet = ?
+            SELECT COUNT(*) FROM tokens 
+            WHERE creator_wallet = ? AND is_graduated = 1
         ''', (wallet,))
-        result = cursor.fetchone()
-        total_tokens = result[0] or 0
-        graduated_tokens = result[1] or 0
+        graduated_tokens = cursor.fetchone()[0] or 0
         migration_percentage = (graduated_tokens / total_tokens * 100) if total_tokens > 0 else 0
         
         # Get last migration time
@@ -501,7 +509,8 @@ async def scan_pump_tokens():
                 if creator:
                     DatabaseOps.update_developer_stats(creator)
                     
-                    # Check if this is a new token from a tracked dev
+                # Check if this is a new token from a tracked dev
+                if creator:
                     dev = DatabaseOps.get_developer(creator)
                     if dev and dev.get("graduated_tokens", 0) > 1:
                         logger.info(f"✅ Tracked dev {creator[:8]}... launched {coin.get('symbol')}")
