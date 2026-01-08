@@ -769,6 +769,43 @@ async def health_check():
         "version": "3.0.0"
     }
 
+@app.get("/api/debug/db-stats")
+async def get_db_stats():
+    """Debug endpoint to check database state"""
+    try:
+        conn = DatabaseOps.get_connection()
+        cursor = conn.cursor()
+        
+        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM developers')
+        devs_count = cursor.fetchone()[0]
+        
+        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens')
+        tokens_count = cursor.fetchone()[0]
+        
+        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM events')
+        events_count = cursor.fetchone()[0]
+        
+        # Get sample developer
+        DatabaseOps.execute(cursor, 'SELECT wallet, total_tokens, graduated_tokens FROM developers LIMIT 1')
+        sample_dev = cursor.fetchone()
+        
+        conn.close()
+        
+        return {
+            "status": "ok",
+            "developers_count": devs_count,
+            "tokens_count": tokens_count,
+            "events_count": events_count,
+            "sample_developer": {
+                "wallet": sample_dev[0] if sample_dev else None,
+                "total_tokens": sample_dev[1] if sample_dev else None,
+                "graduated_tokens": sample_dev[2] if sample_dev else None
+            } if sample_dev else None,
+            "database_type": "PostgreSQL" if USE_POSTGRES else "SQLite"
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 @app.get("/api/token/{mint}", response_model=TokenInfo)
 async def get_token_info(mint: str):
     """Get information about a specific token"""
