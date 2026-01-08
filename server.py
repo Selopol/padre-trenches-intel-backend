@@ -1084,12 +1084,12 @@ async def enrich_token_data():
     """Try to enrich tokens that have no creator data"""
     while True:
         try:
-            await asyncio.sleep(300)  # Run every 5 minutes
+            await asyncio.sleep(60)  # Run every 1 minute
             
             conn = DatabaseOps.get_connection()
             cursor = conn.cursor()
             DatabaseOps.execute(cursor, 
-                'SELECT mint FROM tokens WHERE creator_wallet IS NULL AND is_graduated = 1 LIMIT 10'
+                'SELECT mint FROM tokens WHERE creator_wallet IS NULL AND is_graduated = 1 LIMIT 50'
             )
             tokens_to_enrich = [row[0] for row in cursor.fetchall()]
             conn.close()
@@ -1269,6 +1269,60 @@ async def get_db_stats():
             "graduated_tokens": graduated_count,
             "events_count": events_count,
             "database_type": "PostgreSQL" if USE_POSTGRES else "SQLite"
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.post("/api/debug/force-enrich")
+async def force_enrich_tokens(limit: int = 100):
+    """Force enrich tokens without creator using Moralis API"""
+    try:
+        conn = DatabaseOps.get_connection()
+        cursor = conn.cursor()
+        DatabaseOps.execute(cursor, 
+            f'SELECT mint FROM tokens WHERE creator_wallet IS NULL AND is_graduated = 1 LIMIT {limit}'
+        )
+        tokens_to_enrich = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        if not tokens_to_enrich:
+            return {"status": "ok", "message": "No tokens to enrich", "enriched": 0}
+        
+        enriched = 0
+        failed = 0
+        
+        for mint in tokens_to_enrich:
+            try:
+                # Use Moralis directly (faster than pump.fun)
+                creator = moralis_client.get_token_creator(mint)
+                
+                if creator:
+                    moralis_meta = moralis_client.get_token_metadata(mint)
+                    token_info = {
+                        "mint": mint,
+                        "name": moralis_meta.get("name") if moralis_meta else f"Token {mint[:8]}...",
+                        "symbol": moralis_meta.get("symbol") if moralis_meta else "???",
+                        "creator": creator,
+                        "complete": True,
+                        "is_graduated": True
+                    }
+                    DatabaseOps.save_token(token_info)
+                    DatabaseOps.update_developer_stats(creator)
+                    enriched += 1
+                    logger.info(f"[Force-Enrich] {mint[:8]}... -> {creator[:8]}...")
+                else:
+                    failed += 1
+                
+                await asyncio.sleep(0.5)  # Rate limit
+            except Exception as e:
+                logger.error(f"Error enriching {mint}: {e}")
+                failed += 1
+        
+        return {
+            "status": "ok",
+            "total": len(tokens_to_enrich),
+            "enriched": enriched,
+            "failed": failed
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
