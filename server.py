@@ -142,6 +142,45 @@ class PumpFunClient:
             logger.error(f"Error fetching user coins for {address}: {e}")
             return []
 
+# Twitter API Client
+class TwitterClient:
+    """Client for twitterapi.io to get community moderators"""
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.twitterapi.io"
+        self.session = requests.Session()
+        self.session.headers.update({
+            "X-API-Key": api_key
+        })
+    
+    def extract_community_id(self, url: str) -> Optional[str]:
+        """Extract community ID from URL"""
+        if not url:
+            return None
+        pattern = r'(?:twitter\.com|x\.com)/i/communities/(\d+)'
+        match = re.search(pattern, url)
+        return match.group(1) if match else None
+    
+    def get_community_admin(self, community_id: str) -> Optional[str]:
+        """Get community admin (creator) screen_name"""
+        try:
+            url = f"{self.base_url}/twitter/community/info"
+            params = {"community_id": community_id}
+            response = self.session.get(url, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "success":
+                    community_info = data.get("community_info", {})
+                    admin = community_info.get("admin", {})
+                    if admin:
+                        return admin.get("screen_name")
+            return None
+        except Exception as e:
+            logger.error(f"Twitter API error for community {community_id}: {e}")
+            return None
+
 # Twitter handle extractor
 def extract_twitter_handle(url: str) -> Optional[str]:
     """Extract Twitter handle from URL"""
@@ -164,6 +203,7 @@ def extract_twitter_handle(url: str) -> Optional[str]:
 
 # Initialize clients
 pumpfun_client = PumpFunClient(PUMPFUN_API_URL)
+twitter_client = TwitterClient(TWITTER_API_KEY)
 
 # Database operations
 class DatabaseOps:
@@ -252,13 +292,19 @@ class DatabaseOps:
         ''', (wallet,))
         last_launch = cursor.fetchone()[0]
         
-        # Get twitter handle from any token
+        # Get twitter handle ONLY from community links (ignore tweets)
         cursor.execute('''
             SELECT twitter_link FROM tokens 
-            WHERE creator_wallet = ? AND twitter_link IS NOT NULL LIMIT 1
+            WHERE creator_wallet = ? AND twitter_link LIKE '%/i/communities/%' LIMIT 1
         ''', (wallet,))
         twitter_result = cursor.fetchone()
-        twitter_handle = extract_twitter_handle(twitter_result[0]) if twitter_result else None
+        twitter_handle = None
+        if twitter_result:
+            twitter_link = twitter_result[0]
+            # Extract community admin via twitterapi.io
+            community_id = twitter_client.extract_community_id(twitter_link)
+            if community_id:
+                twitter_handle = twitter_client.get_community_admin(community_id)
         
         cursor.execute('''
             INSERT OR REPLACE INTO developers 
@@ -344,6 +390,35 @@ class DatabaseOps:
         ''', (event_type, dev_wallet, token_mint, json.dumps(data)))
         conn.commit()
         conn.close()
+    
+    @staticmethod
+    def get_dev_tokens(wallet: str, limit: int = 100) -> List[Dict]:
+        """Get all tokens by a developer"""
+        conn = DatabaseOps.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM tokens 
+            WHERE creator_wallet = ? 
+            ORDER BY created_at DESC 
+            LIMIT ?
+        ''', (wallet, limit))
+        rows = cursor.fetchall()
+        conn.close()
+        return [{
+            "mint": row[0],
+            "name": row[1],
+            "symbol": row[2],
+            "creator_wallet": row[3],
+            "twitter_link": row[4],
+            "telegram_link": row[5],
+            "website_link": row[6],
+            "description": row[7],
+            "image_uri": row[8],
+            "is_graduated": bool(row[9]),
+            "created_at": row[10],
+            "graduated_at": row[11],
+            "market_cap": row[12]
+        } for row in rows]
 
 # Background task to scan tokens
 async def scan_pump_tokens():
@@ -544,6 +619,30 @@ async def get_dev_info(wallet: str):
     
     return DevInfo(**dev)
 
+@app.get("/api/dev/{wallet}/tokens")
+async def get_dev_tokens(wallet: str, limit: int = 100):
+    """Get all tokens created by a developer with full details"""
+    dev = DatabaseOps.get_developer(wallet)
+    if not dev:
+        # Try to fetch from Pump.fun API
+        coins = pumpfun_client.fetch_user_coins(wallet)
+        if not coins:
+            raise HTTPException(status_code=404, detail="Developer not found")
+        
+        # Save coins and update stats
+        for coin in coins:
+            DatabaseOps.save_token(coin)
+        DatabaseOps.update_developer_stats(wallet)
+        dev = DatabaseOps.get_developer(wallet)
+    
+    tokens = DatabaseOps.get_dev_tokens(wallet, limit)
+    
+    return {
+        "developer": dev,
+        "tokens": tokens,
+        "total_count": len(tokens)
+    }
+
 @app.get("/api/top-devs/by-percentage", response_model=TopDevsResponse)
 async def get_top_devs_by_percentage(limit: int = 50):
     """Get top developers sorted by migration percentage"""
@@ -561,6 +660,36 @@ async def get_top_devs_by_count(limit: int = 50):
         devs=[DevInfo(**dev) for dev in devs],
         updated_at=datetime.utcnow().isoformat()
     )
+
+@app.get("/api/top-devs/detailed")
+async def get_top_devs_detailed(limit: int = 50, by: str = "percentage"):
+    """Get top developers with their latest token info"""
+    if by == "count":
+        devs = DatabaseOps.get_top_devs_by_count(limit)
+    else:
+        devs = DatabaseOps.get_top_devs_by_percentage(limit)
+    
+    # Enrich with latest token info
+    detailed_devs = []
+    for dev in devs:
+        tokens = DatabaseOps.get_dev_tokens(dev["wallet"], limit=1)
+        latest_token = tokens[0] if tokens else None
+        
+        detailed_devs.append({
+            "wallet": dev["wallet"],
+            "twitter_handle": dev["twitter_handle"],
+            "total_tokens": dev["total_tokens"],
+            "migrated_tokens": dev["migrated_tokens"],
+            "migration_percentage": dev["migration_percentage"],
+            "last_migration_at": dev["last_migration_at"],
+            "last_token_launch_at": dev["last_token_launch_at"],
+            "latest_token": latest_token
+        })
+    
+    return {
+        "devs": detailed_devs,
+        "updated_at": datetime.utcnow().isoformat()
+    }
 
 @app.get("/api/events")
 async def get_events(limit: int = 50):
