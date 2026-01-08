@@ -176,7 +176,8 @@ class PumpFunClient:
         self.base_url = base_url
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (compatible; PumpTracker/1.0)",
+            "Accept": "application/json"
         })
     
     def get_token_info(self, mint: str) -> Optional[Dict]:
