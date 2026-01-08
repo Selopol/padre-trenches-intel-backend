@@ -143,6 +143,18 @@ def init_database():
             )
         ''')
     
+    # Create indexes for better performance
+    if USE_POSTGRES:
+        try:
+            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_tokens_creator ON tokens(creator_wallet)')
+            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_tokens_graduated ON tokens(is_graduated)')
+            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_tokens_created ON tokens(created_at DESC)')
+            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_devs_percentage ON developers(migration_percentage DESC)')
+            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_devs_tokens ON developers(total_tokens)')
+            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_events_processed ON events(processed)')
+        except Exception as e:
+            logger.warning(f"Index creation warning: {e}")
+    
     conn.commit()
     conn.close()
     db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
