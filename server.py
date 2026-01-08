@@ -290,20 +290,33 @@ class HeliusClient:
             return []
     
     def parse_migration_transaction(self, tx: Dict) -> Optional[Dict]:
-        """Parse a transaction to extract migration info"""
+        """Parse a transaction to extract migration info from Helius REST API format"""
         try:
-            # Look for postTokenBalances with pump token
-            post_balances = tx.get("meta", {}).get("postTokenBalances", [])
+            # Helius REST API returns tokenTransfers array
+            token_transfers = tx.get("tokenTransfers", [])
             
-            for balance in post_balances:
-                mint = balance.get("mint", "")
+            for transfer in token_transfers:
+                mint = transfer.get("mint", "")
                 if mint.endswith("pump"):
                     return {
                         "token_mint": mint,
                         "signature": tx.get("signature"),
                         "slot": tx.get("slot"),
-                        "timestamp": tx.get("blockTime")
+                        "timestamp": tx.get("timestamp")
                     }
+            
+            # Also check accountData for token balance changes
+            account_data = tx.get("accountData", [])
+            for account in account_data:
+                for change in account.get("tokenBalanceChanges", []):
+                    mint = change.get("mint", "")
+                    if mint.endswith("pump"):
+                        return {
+                            "token_mint": mint,
+                            "signature": tx.get("signature"),
+                            "slot": tx.get("slot"),
+                            "timestamp": tx.get("timestamp")
+                        }
             return None
         except Exception as e:
             logger.error(f"Error parsing transaction: {e}")
@@ -743,8 +756,12 @@ async def process_migration_log(data: Dict):
 async def extract_and_save_migration(tx_data: Dict, signature: str):
     """Extract token info from migration transaction and save"""
     try:
-        meta = tx_data.get("meta", {})
-        post_token_balances = meta.get("postTokenBalances", [])
+        if not tx_data:
+            logger.warning(f"No transaction data for {signature}")
+            return
+            
+        meta = tx_data.get("meta") or {}
+        post_token_balances = meta.get("postTokenBalances") or []
         
         # Find the pump token
         token_mint = None
