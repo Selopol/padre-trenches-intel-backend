@@ -828,7 +828,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Padre Trenches Dev Intel API",
-    version="7.0.1",
+    version="7.0.2",
     lifespan=lifespan
 )
 
@@ -847,7 +847,7 @@ app.add_middleware(
 async def root():
     return {
         "name": "Padre Trenches Dev Intel API",
-        "version": "7.0.1",
+        "version": "7.0.2",
         "status": "running",
         "api": "PumpPortal WebSocket + DexScreener + Helius",
         "endpoints": [
@@ -965,6 +965,33 @@ async def force_enrich(limit: int = 50):
             logger.error(f"Error enriching {mint[:8]}...: {e}")
     
     return {"enriched": enriched, "total": len(tokens)}
+
+
+@app.post("/api/debug/recalculate-devs")
+async def recalculate_devs():
+    """Recalculate all developer statistics"""
+    try:
+        conn = DatabaseOps.get_connection()
+        cursor = conn.cursor()
+        
+        # Get all developers
+        DatabaseOps.execute(cursor, 'SELECT wallet FROM developers')
+        wallets = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        recalculated = 0
+        for wallet in wallets:
+            try:
+                DatabaseOps.update_developer_stats(wallet)
+                recalculated += 1
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Error recalculating {wallet[:8]}...: {e}")
+        
+        return {"recalculated": recalculated, "total": len(wallets)}
+    except Exception as e:
+        logger.error(f"Error in recalculate-devs: {e}")
+        return {"error": str(e)}
 
 
 # WebSocket for real-time updates
