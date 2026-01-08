@@ -52,7 +52,7 @@ def init_database():
     
     if USE_POSTGRES:
         # PostgreSQL schema (use SERIAL for auto-increment, FALSE instead of 0)
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             CREATE TABLE IF NOT EXISTS tokens (
                 mint TEXT PRIMARY KEY,
                 name TEXT,
@@ -71,7 +71,7 @@ def init_database():
             )
         ''')
         
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             CREATE TABLE IF NOT EXISTS developers (
                 wallet TEXT PRIMARY KEY,
                 twitter_handle TEXT,
@@ -85,7 +85,7 @@ def init_database():
             )
         ''')
         
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             CREATE TABLE IF NOT EXISTS events (
                 id SERIAL PRIMARY KEY,
                 event_type TEXT,
@@ -98,7 +98,7 @@ def init_database():
         ''')
     else:
         # SQLite schema
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             CREATE TABLE IF NOT EXISTS tokens (
                 mint TEXT PRIMARY KEY,
                 name TEXT,
@@ -117,7 +117,7 @@ def init_database():
             )
         ''')
         
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             CREATE TABLE IF NOT EXISTS developers (
                 wallet TEXT PRIMARY KEY,
                 twitter_handle TEXT,
@@ -131,7 +131,7 @@ def init_database():
             )
         ''')
         
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT,
@@ -282,11 +282,44 @@ class DatabaseOps:
             return sqlite3.connect(DATABASE_PATH)
     
     @staticmethod
+    def execute(cursor, query, params=None):
+        """Execute query with automatic placeholder conversion for PostgreSQL"""
+        if USE_POSTGRES:
+            # Convert SQLite ? placeholders to PostgreSQL %s
+            query = query.replace('?', '%s')
+            # Convert SQLite BOOLEAN values to PostgreSQL
+            query = query.replace('= 0', '= FALSE').replace('= 1', '= TRUE')
+            # Convert INSERT OR REPLACE to PostgreSQL UPSERT
+            if 'INSERT OR REPLACE INTO tokens' in query:
+                query = query.replace('INSERT OR REPLACE INTO tokens', 
+                    'INSERT INTO tokens').replace('VALUES (', 'VALUES (') + \
+                    ' ON CONFLICT (mint) DO UPDATE SET ' + \
+                    'name=EXCLUDED.name, symbol=EXCLUDED.symbol, creator_wallet=EXCLUDED.creator_wallet, ' + \
+                    'twitter_link=EXCLUDED.twitter_link, telegram_link=EXCLUDED.telegram_link, ' + \
+                    'website_link=EXCLUDED.website_link, description=EXCLUDED.description, ' + \
+                    'image_uri=EXCLUDED.image_uri, is_graduated=EXCLUDED.is_graduated, ' + \
+                    'created_at=EXCLUDED.created_at, graduated_at=EXCLUDED.graduated_at, ' + \
+                    'market_cap=EXCLUDED.market_cap, updated_at=CURRENT_TIMESTAMP'
+            elif 'INSERT OR REPLACE INTO developers' in query:
+                query = query.replace('INSERT OR REPLACE INTO developers',
+                    'INSERT INTO developers').replace('VALUES (', 'VALUES (') + \
+                    ' ON CONFLICT (wallet) DO UPDATE SET ' + \
+                    'twitter_handle=EXCLUDED.twitter_handle, total_tokens=EXCLUDED.total_tokens, ' + \
+                    'graduated_tokens=EXCLUDED.graduated_tokens, migration_percentage=EXCLUDED.migration_percentage, ' + \
+                    'last_migration_at=EXCLUDED.last_migration_at, last_token_launch_at=EXCLUDED.last_token_launch_at, ' + \
+                    'updated_at=CURRENT_TIMESTAMP'
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        return cursor
+    
+    @staticmethod
     def save_token(token_data: Dict):
         try:
             conn = DatabaseOps.get_connection()
             cursor = conn.cursor()
-            cursor.execute('''
+            DatabaseOps.execute(cursor, '''
                 INSERT OR REPLACE INTO tokens 
                 (mint, name, symbol, creator_wallet, twitter_link, telegram_link, website_link, 
                  description, image_uri, is_graduated, created_at, graduated_at, market_cap, updated_at)
@@ -317,7 +350,7 @@ class DatabaseOps:
     def get_token(mint: str) -> Optional[Dict]:
         conn = DatabaseOps.get_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT * FROM tokens WHERE mint = ?', (mint,))
+        DatabaseOps.execute(cursor, 'SELECT * FROM tokens WHERE mint = ?', (mint,))
         row = cursor.fetchone()
         conn.close()
         if row:
@@ -358,7 +391,7 @@ class DatabaseOps:
         total_tokens = api_response.get("count", 0) if isinstance(api_response, dict) else 0
         
         # Count graduated tokens from database
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             SELECT COUNT(*) FROM tokens 
             WHERE creator_wallet = ? AND is_graduated = 1
         ''', (wallet,))
@@ -366,20 +399,20 @@ class DatabaseOps:
         migration_percentage = (graduated_tokens / total_tokens * 100) if total_tokens > 0 else 0
         
         # Get last migration time
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             SELECT MAX(graduated_at) FROM tokens 
             WHERE creator_wallet = ? AND is_graduated = 1
         ''', (wallet,))
         last_migration = cursor.fetchone()[0]
         
         # Get last token launch time
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             SELECT MAX(created_at) FROM tokens WHERE creator_wallet = ?
         ''', (wallet,))
         last_launch = cursor.fetchone()[0]
         
         # Get twitter handle ONLY from community links (ignore tweets)
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             SELECT twitter_link FROM tokens 
             WHERE creator_wallet = ? AND twitter_link LIKE '%/i/communities/%' LIMIT 1
         ''', (wallet,))
@@ -392,7 +425,7 @@ class DatabaseOps:
             if community_id:
                 twitter_handle = twitter_client.get_community_admin(community_id)
         
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             INSERT OR REPLACE INTO developers 
             (wallet, twitter_handle, total_tokens, graduated_tokens, migration_percentage, 
              last_migration_at, last_token_launch_at, updated_at)
@@ -407,7 +440,7 @@ class DatabaseOps:
     def get_developer(wallet: str) -> Optional[Dict]:
         conn = DatabaseOps.get_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT * FROM developers WHERE wallet = ?', (wallet,))
+        DatabaseOps.execute(cursor, 'SELECT * FROM developers WHERE wallet = ?', (wallet,))
         row = cursor.fetchone()
         conn.close()
         if row:
@@ -426,7 +459,7 @@ class DatabaseOps:
     def get_top_devs_by_percentage(limit: int = 50) -> List[Dict]:
         conn = DatabaseOps.get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             SELECT * FROM developers 
             WHERE total_tokens >= 2
             ORDER BY migration_percentage DESC, graduated_tokens DESC
@@ -448,7 +481,7 @@ class DatabaseOps:
     def get_top_devs_by_count(limit: int = 50) -> List[Dict]:
         conn = DatabaseOps.get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             SELECT * FROM developers 
             ORDER BY graduated_tokens DESC, migration_percentage DESC
             LIMIT ?
@@ -470,7 +503,7 @@ class DatabaseOps:
         """Add a new event to the database"""
         conn = DatabaseOps.get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             INSERT INTO events (event_type, dev_wallet, token_mint, data)
             VALUES (?, ?, ?, ?)
         ''', (event_type, dev_wallet, token_mint, json.dumps(data)))
@@ -482,7 +515,7 @@ class DatabaseOps:
         """Get all tokens by a developer"""
         conn = DatabaseOps.get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
+        DatabaseOps.execute(cursor, '''
             SELECT * FROM tokens 
             WHERE creator_wallet = ? 
             ORDER BY created_at DESC 
@@ -820,7 +853,7 @@ async def get_events(limit: int = 50):
     """Get recent unprocessed events"""
     conn = DatabaseOps.get_connection()
     cursor = conn.cursor()
-    cursor.execute('''
+    DatabaseOps.execute(cursor, '''
         SELECT * FROM events 
         WHERE processed = 0 
         ORDER BY created_at DESC 
