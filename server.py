@@ -410,11 +410,17 @@ class DatabaseOps:
             ''', (wallet,))
             total_tokens = cursor.fetchone()[0]
             
-            # Count graduated tokens
-            DatabaseOps.execute(cursor, '''
-                SELECT COUNT(*) FROM tokens 
-                WHERE creator_wallet = ? AND is_graduated = 1
-            ''', (wallet,))
+            # Count graduated tokens (use TRUE for PostgreSQL, 1 for SQLite)
+            if USE_POSTGRES:
+                DatabaseOps.execute(cursor, '''
+                    SELECT COUNT(*) FROM tokens 
+                    WHERE creator_wallet = %s AND is_graduated = TRUE
+                ''', (wallet,))
+            else:
+                DatabaseOps.execute(cursor, '''
+                    SELECT COUNT(*) FROM tokens 
+                    WHERE creator_wallet = ? AND is_graduated = 1
+                ''', (wallet,))
             graduated_tokens = cursor.fetchone()[0]
             
             # Calculate migration percentage
@@ -424,10 +430,16 @@ class DatabaseOps:
             migration_percentage = (graduated_tokens / total_tokens * 100) if total_tokens > 0 else 0
             
             # Get last migration time
-            DatabaseOps.execute(cursor, '''
-                SELECT MAX(graduated_at) FROM tokens 
-                WHERE creator_wallet = ? AND is_graduated = 1
-            ''', (wallet,))
+            if USE_POSTGRES:
+                DatabaseOps.execute(cursor, '''
+                    SELECT MAX(graduated_at) FROM tokens 
+                    WHERE creator_wallet = %s AND is_graduated = TRUE
+                ''', (wallet,))
+            else:
+                DatabaseOps.execute(cursor, '''
+                    SELECT MAX(graduated_at) FROM tokens 
+                    WHERE creator_wallet = ? AND is_graduated = 1
+                ''', (wallet,))
             result = cursor.fetchone()
             last_migration = result[0] if result else None
             
@@ -759,11 +771,18 @@ async def enrich_token_data():
             cursor = conn.cursor()
             
             # Find tokens without image that are graduated
-            DatabaseOps.execute(cursor, '''
-                SELECT mint FROM tokens 
-                WHERE is_graduated = 1 AND (image_uri IS NULL OR image_uri = '')
-                LIMIT 20
-            ''')
+            if USE_POSTGRES:
+                cursor.execute('''
+                    SELECT mint FROM tokens 
+                    WHERE is_graduated = TRUE AND (image_uri IS NULL OR image_uri = '')
+                    LIMIT 20
+                ''')
+            else:
+                cursor.execute('''
+                    SELECT mint FROM tokens 
+                    WHERE is_graduated = 1 AND (image_uri IS NULL OR image_uri = '')
+                    LIMIT 20
+                ''')
             tokens_to_enrich = [row[0] for row in cursor.fetchall()]
             conn.close()
             
@@ -828,7 +847,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Padre Trenches Dev Intel API",
-    version="7.0.2",
+    version="7.0.3",
     lifespan=lifespan
 )
 
@@ -847,7 +866,7 @@ app.add_middleware(
 async def root():
     return {
         "name": "Padre Trenches Dev Intel API",
-        "version": "7.0.2",
+        "version": "7.0.3",
         "status": "running",
         "api": "PumpPortal WebSocket + DexScreener + Helius",
         "endpoints": [
@@ -929,12 +948,20 @@ async def force_enrich(limit: int = 50):
     conn = DatabaseOps.get_connection()
     cursor = conn.cursor()
     
-    DatabaseOps.execute(cursor, '''
-        SELECT mint FROM tokens 
-        WHERE is_graduated = 1
-        ORDER BY graduated_at DESC
-        LIMIT ?
-    ''', (limit,))
+    if USE_POSTGRES:
+        cursor.execute('''
+            SELECT mint FROM tokens 
+            WHERE is_graduated = TRUE
+            ORDER BY graduated_at DESC
+            LIMIT %s
+        ''', (limit,))
+    else:
+        cursor.execute('''
+            SELECT mint FROM tokens 
+            WHERE is_graduated = 1
+            ORDER BY graduated_at DESC
+            LIMIT ?
+        ''', (limit,))
     tokens = [row[0] for row in cursor.fetchall()]
     conn.close()
     
