@@ -1,11 +1,12 @@
 """
 Padre Trenches Dev Intel - Backend Server
-Tracks Solana token developers using Helius WebSocket + Pump.fun API
+Tracks Solana token developers using Helius WebSocket + DexScreener + Pump.fun API
 
 Architecture:
 1. Migrated tokens → Helius WebSocket (subscribe to PumpSwap program)
-2. Token creator → pump.fun API: GET /coins/{tokenAddress}
-3. Total tokens per wallet → pump.fun API: GET /balances/{walletAddress}
+2. Token metadata (image, twitter) → DexScreener API
+3. Token creator → Pump.fun API (fallback)
+4. Twitter handle → Twitter API (from community links)
 """
 
 import os
@@ -40,8 +41,7 @@ HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "14649a76-7c70-443c-b6da-41cffe2543
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 HELIUS_WS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 TWITTER_API_KEY = "new1_defb379335c44d58890c0e2c59ada78f"
-MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjhlMTFlNjEyLTNiMzUtNDAyMS04M2UxLWYwYWZiZWZmOWZkNyIsIm9yZ0lkIjoiNDg5MzA5IiwidXNlcklkIjoiNTAzNDQwIiwidHlwZUlkIjoiMmViNWQyNjEtMTg4MS00Mjc3LWJlYjAtMDBmYWVhNmUxZTUzIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3Njc4OTIzNzIsImV4cCI6NDkyMzY1MjM3Mn0.9AYBgfJ9NEQ-BVGCeD7oGlJftXm6T6LQPOBRZ28DI2A")
-MORALIS_BASE_URL = "https://solana-gateway.moralis.io"
+DEXSCREENER_API_URL = "https://api.dexscreener.com"  # No API key needed
 DATABASE_URL = os.getenv("DATABASE_URL", None)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "dev_intel.db")
 USE_POSTGRES = DATABASE_URL is not None and POSTGRES_AVAILABLE
@@ -447,68 +447,64 @@ class TwitterClient:
             return None
 
 
-class MoralisClient:
-    """Client for Moralis Solana API - used to get token creator via first swap"""
+class DexScreenerClient:
+    """Client for DexScreener API - get token info, image, socials"""
     
-    def __init__(self, api_key: str, base_url: str):
-        self.api_key = api_key
-        self.base_url = base_url
+    def __init__(self):
+        self.base_url = "https://api.dexscreener.com"
         self.session = requests.Session()
         self.session.headers.update({
             "accept": "application/json",
-            "X-API-Key": api_key
+            "User-Agent": "Mozilla/5.0 (compatible; PumpTracker/1.0)"
         })
     
-    def get_token_creator(self, mint: str) -> Optional[str]:
-        """Get token creator by finding the first swap (creator is the first buyer)"""
+    def get_token_info(self, mint: str) -> Optional[Dict]:
+        """Get token info from DexScreener including image and socials"""
         try:
-            url = f"{self.base_url}/token/mainnet/{mint}/swaps?limit=1&order=ASC"
+            url = f"{self.base_url}/latest/dex/tokens/{mint}"
             response = self.session.get(url, timeout=15)
             
             if response.status_code == 200:
                 data = response.json()
-                if data.get("result") and len(data["result"]) > 0:
-                    first_swap = data["result"][0]
-                    creator = first_swap.get("walletAddress")
-                    logger.info(f"[Moralis] Found creator for {mint[:8]}...: {creator[:8] if creator else 'N/A'}...")
-                    return creator
-            else:
-                logger.warning(f"[Moralis] Error fetching first swap: {response.status_code}")
+                pairs = data.get("pairs", [])
+                
+                if pairs:
+                    pair = pairs[0]  # Get first pair (usually PumpSwap)
+                    base_token = pair.get("baseToken", {})
+                    info = pair.get("info", {})
+                    socials = info.get("socials", [])
+                    
+                    # Find twitter/community link
+                    twitter_link = None
+                    for social in socials:
+                        if social.get("type") == "twitter":
+                            twitter_link = social.get("url")
+                            break
+                    
+                    result = {
+                        "mint": mint,
+                        "name": base_token.get("name"),
+                        "symbol": base_token.get("symbol"),
+                        "image_uri": info.get("imageUrl"),
+                        "twitter": twitter_link,
+                        "price_usd": pair.get("priceUsd"),
+                        "market_cap": pair.get("marketCap") or pair.get("fdv"),
+                        "dex_id": pair.get("dexId")
+                    }
+                    
+                    logger.info(f"[DexScreener] Got info for {mint[:8]}...: {result.get('symbol')}")
+                    return result
+                    
             return None
         except Exception as e:
-            logger.error(f"[Moralis] Error getting token creator: {e}")
+            logger.error(f"[DexScreener] Error getting token info: {e}")
             return None
     
-    def get_graduated_tokens(self, limit: int = 50) -> List[Dict]:
-        """Get graduated tokens from Moralis API"""
-        try:
-            url = f"{self.base_url}/token/mainnet/exchange/pumpfun/graduated?limit={limit}"
-            response = self.session.get(url, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                tokens = data.get("result", [])
-                logger.info(f"[Moralis] Fetched {len(tokens)} graduated tokens")
-                return tokens
-            else:
-                logger.warning(f"[Moralis] Error fetching graduated tokens: {response.status_code}")
-            return []
-        except Exception as e:
-            logger.error(f"[Moralis] Error fetching graduated tokens: {e}")
-            return []
-    
-    def get_token_metadata(self, mint: str) -> Optional[Dict]:
-        """Get token metadata from Moralis"""
-        try:
-            url = f"{self.base_url}/token/mainnet/{mint}/metadata"
-            response = self.session.get(url, timeout=15)
-            
-            if response.status_code == 200:
-                return response.json()
-            return None
-        except Exception as e:
-            logger.error(f"[Moralis] Error getting token metadata: {e}")
-            return None
+    def get_token_creator_from_first_trade(self, mint: str) -> Optional[str]:
+        """Try to get creator from first trade - not reliable, use Helius instead"""
+        # DexScreener doesn't provide creator info directly
+        # We'll use Helius for this
+        return None
 
 
 def extract_twitter_handle(url: str) -> Optional[str]:
@@ -531,7 +527,7 @@ def extract_twitter_handle(url: str) -> Optional[str]:
 pumpfun_client = PumpFunClient(PUMPFUN_API_URL)
 helius_client = HeliusClient(HELIUS_API_KEY)
 twitter_client = TwitterClient(TWITTER_API_KEY)
-moralis_client = MoralisClient(MORALIS_API_KEY, MORALIS_BASE_URL)
+dexscreener_client = DexScreenerClient()
 
 
 class DatabaseOps:
@@ -1101,50 +1097,40 @@ async def enrich_token_data():
             
             for mint in tokens_to_enrich:
                 creator = None
-                token_info = pumpfun_client.get_token_info(mint)
                 
-                if token_info and token_info.get("creator"):
-                    # Got data from pump.fun
-                    creator = token_info.get("creator")
-                    token_info["complete"] = True
-                    token_info["is_graduated"] = True
-                    DatabaseOps.save_token(token_info)
-                else:
-                    # Fallback to Moralis
-                    creator = moralis_client.get_token_creator(mint)
-                    if creator:
-                        moralis_meta = moralis_client.get_token_metadata(mint)
-                        
-                        # Extract links from Moralis
-                        links = moralis_meta.get("links", {}) if moralis_meta else {}
-                        twitter_link = links.get("twitter")
-                        website_link = links.get("website")
-                        
-                        # Check for community link
-                        community_link = None
-                        if website_link and "/i/communities/" in website_link:
-                            community_link = website_link
-                        elif twitter_link and "/i/communities/" in twitter_link:
-                            community_link = twitter_link
-                        
-                        token_info = {
-                            "mint": mint,
-                            "name": moralis_meta.get("name") if moralis_meta else f"Token {mint[:8]}...",
-                            "symbol": moralis_meta.get("symbol") if moralis_meta else "???",
-                            "creator": creator,
-                            "twitter": community_link or twitter_link,
-                            "website": website_link if not community_link else None,
-                            "complete": True,
-                            "is_graduated": True
-                        }
-                        DatabaseOps.save_token(token_info)
-                        logger.info(f"[Moralis] Enriched token {mint[:8]}... with creator {creator[:8]}...")
+                # Try pump.fun first for creator
+                pumpfun_info = pumpfun_client.get_token_info(mint)
+                if pumpfun_info and pumpfun_info.get("creator"):
+                    creator = pumpfun_info.get("creator")
+                    pumpfun_info["complete"] = True
+                    pumpfun_info["is_graduated"] = True
+                    DatabaseOps.save_token(pumpfun_info)
+                    logger.info(f"[Pump.fun] Enriched token {mint[:8]}... with creator {creator[:8]}...")
+                
+                # Get additional info from DexScreener (image, twitter)
+                dex_info = dexscreener_client.get_token_info(mint)
+                if dex_info:
+                    twitter_link = dex_info.get("twitter")
+                    
+                    token_update = {
+                        "mint": mint,
+                        "name": dex_info.get("name") or f"Token {mint[:8]}...",
+                        "symbol": dex_info.get("symbol") or "???",
+                        "image_uri": dex_info.get("image_uri"),
+                        "twitter": twitter_link,
+                        "market_cap": dex_info.get("market_cap"),
+                        "creator": creator,  # Keep creator if we got it
+                        "complete": True,
+                        "is_graduated": True
+                    }
+                    DatabaseOps.save_token(token_update)
+                    logger.info(f"[DexScreener] Updated token {mint[:8]}... with image and twitter")
                 
                 if creator:
                     DatabaseOps.update_developer_stats(creator)
                     logger.info(f"Enriched token {mint[:8]}... with creator {creator[:8]}...")
                 
-                await asyncio.sleep(2)  # Rate limit
+                await asyncio.sleep(1)  # Rate limit
                 
         except Exception as e:
             logger.error(f"Error enriching tokens: {e}")
@@ -1244,8 +1230,8 @@ async def root():
     return {
         "status": "ok",
         "service": "Padre Trenches Dev Intel API",
-        "version": "5.0.0",
-        "api": "Helius WebSocket + Pump.fun + Moralis"
+        "version": "6.0.0",
+        "api": "Helius WebSocket + DexScreener + Pump.fun"
     }
 
 @app.get("/api/health")
@@ -1254,7 +1240,7 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "database": "connected",
-        "version": "5.0.0"
+        "version": "6.0.0"
     }
 
 @app.get("/api/debug/db-stats")
@@ -1290,12 +1276,13 @@ async def get_db_stats():
 
 @app.post("/api/debug/force-enrich")
 async def force_enrich_tokens(limit: int = 100):
-    """Force enrich tokens without creator using Moralis API"""
+    """Force enrich tokens using DexScreener for metadata and Helius for creator"""
     try:
         conn = DatabaseOps.get_connection()
         cursor = conn.cursor()
+        # Get tokens that need enrichment (no creator or no image)
         DatabaseOps.execute(cursor, 
-            f'SELECT mint FROM tokens WHERE creator_wallet IS NULL AND is_graduated = 1 LIMIT {limit}'
+            f'SELECT mint FROM tokens WHERE (creator_wallet IS NULL OR image_uri IS NULL) AND is_graduated = 1 LIMIT {limit}'
         )
         tokens_to_enrich = [row[0] for row in cursor.fetchall()]
         conn.close()
@@ -1308,31 +1295,32 @@ async def force_enrich_tokens(limit: int = 100):
         
         for mint in tokens_to_enrich:
             try:
-                # Use Moralis directly (faster than pump.fun)
-                creator = moralis_client.get_token_creator(mint)
+                # Get token info from DexScreener (image, name, symbol, twitter)
+                dex_info = dexscreener_client.get_token_info(mint)
                 
-                if creator:
-                    moralis_meta = moralis_client.get_token_metadata(mint)
+                if dex_info:
+                    twitter_link = dex_info.get("twitter")
                     
-                    # Extract links from Moralis metadata
-                    links = moralis_meta.get("links", {}) if moralis_meta else {}
-                    twitter_link = links.get("twitter")
-                    website_link = links.get("website")
-                    
-                    # Check if website is actually a community link
+                    # Check if it's a community link
                     community_link = None
-                    if website_link and "/i/communities/" in website_link:
-                        community_link = website_link
-                    elif twitter_link and "/i/communities/" in twitter_link:
+                    if twitter_link and "/i/communities/" in twitter_link:
                         community_link = twitter_link
                     
+                    # Try to get creator from pump.fun first
+                    creator = None
+                    pumpfun_info = pumpfun_client.get_token_info(mint)
+                    if pumpfun_info:
+                        creator = pumpfun_info.get("creator")
+                    
+                    # Build token info
                     token_info = {
                         "mint": mint,
-                        "name": moralis_meta.get("name") if moralis_meta else f"Token {mint[:8]}...",
-                        "symbol": moralis_meta.get("symbol") if moralis_meta else "???",
+                        "name": dex_info.get("name") or f"Token {mint[:8]}...",
+                        "symbol": dex_info.get("symbol") or "???",
+                        "image_uri": dex_info.get("image_uri"),
+                        "twitter": twitter_link,
+                        "market_cap": dex_info.get("market_cap"),
                         "creator": creator,
-                        "twitter": community_link or twitter_link,  # Prefer community link
-                        "website": website_link if not community_link else None,
                         "complete": True,
                         "is_graduated": True
                     }
@@ -1351,26 +1339,27 @@ async def force_enrich_tokens(limit: int = 100):
                     if not twitter_handle and twitter_link:
                         twitter_handle = extract_twitter_handle(twitter_link)
                     
-                    # Update developer stats (this will also try to get twitter from DB)
-                    DatabaseOps.update_developer_stats(creator)
-                    
-                    # If we found twitter handle, update developer directly
-                    if twitter_handle:
-                        conn = DatabaseOps.get_connection()
-                        cursor = conn.cursor()
-                        DatabaseOps.execute(cursor, 
-                            'UPDATE developers SET twitter_handle = ? WHERE wallet = ?',
-                            (twitter_handle, creator)
-                        )
-                        conn.commit()
-                        conn.close()
+                    # Update developer stats if we have creator
+                    if creator:
+                        DatabaseOps.update_developer_stats(creator)
+                        
+                        # If we found twitter handle, update developer directly
+                        if twitter_handle:
+                            conn = DatabaseOps.get_connection()
+                            cursor = conn.cursor()
+                            DatabaseOps.execute(cursor, 
+                                'UPDATE developers SET twitter_handle = ? WHERE wallet = ?',
+                                (twitter_handle, creator)
+                            )
+                            conn.commit()
+                            conn.close()
                     
                     enriched += 1
-                    logger.info(f"[Force-Enrich] {mint[:8]}... -> {creator[:8]}... (twitter: @{twitter_handle or 'N/A'})")
+                    logger.info(f"[Force-Enrich] {mint[:8]}... -> creator: {creator[:8] if creator else 'N/A'}... image: {'Yes' if dex_info.get('image_uri') else 'No'} twitter: @{twitter_handle or 'N/A'}")
                 else:
                     failed += 1
                 
-                await asyncio.sleep(0.5)  # Rate limit
+                await asyncio.sleep(0.3)  # Rate limit
             except Exception as e:
                 logger.error(f"Error enriching {mint}: {e}")
                 failed += 1
