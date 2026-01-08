@@ -428,12 +428,44 @@ async def scan_pump_tokens():
     # Track seen tokens to avoid duplicates
     seen_tokens = set()
     
+    # First run: fetch ALL migrated tokens from last month
+    first_run = True
+    
     while True:
         try:
-            # Fetch recent migrated coins
-            migrated_coins = pumpfun_client.fetch_migrated_coins(limit=50)
+            migrated_coins = []
             
-            logger.info(f"Fetched {len(migrated_coins)} migrated coins")
+            if first_run:
+                # Fetch ALL migrated tokens with pagination
+                logger.info("First run: fetching ALL migrated tokens...")
+                offset = 0
+                batch_size = 50  # Pump.fun API returns max 50
+                max_pages = 200  # Safety limit (50 * 200 = 10,000 tokens max)
+                
+                for page in range(max_pages):
+                    batch = pumpfun_client.fetch_coins(offset=offset, limit=batch_size, complete=True)
+                    
+                    if not batch or len(batch) == 0:
+                        logger.info(f"No more tokens at offset {offset}, stopping")
+                        break
+                    
+                    migrated_coins.extend(batch)
+                    logger.info(f"Page {page + 1}: Fetched {len(batch)} tokens at offset {offset}, total: {len(migrated_coins)}")
+                    
+                    # If we got less than batch_size, we've reached the end
+                    if len(batch) < batch_size:
+                        logger.info(f"Reached end of tokens (got {len(batch)} < {batch_size})")
+                        break
+                    
+                    offset += len(batch)
+                    await asyncio.sleep(0.3)  # Rate limiting
+                
+                first_run = False
+                logger.info(f"First run complete: {len(migrated_coins)} total migrated tokens fetched")
+            else:
+                # Regular scans: just fetch recent 50
+                migrated_coins = pumpfun_client.fetch_migrated_coins(limit=50)
+                logger.info(f"Regular scan: {len(migrated_coins)} migrated coins")
             
             for coin in migrated_coins:
                 mint = coin.get("mint")
