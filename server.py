@@ -1,12 +1,13 @@
 """
-Padre Trenches Dev Intel - Backend Server
-Tracks Solana token developers using Helius WebSocket + DexScreener + Pump.fun API
+Padre Trenches Dev Intel - Backend Server v7.0
+Tracks Solana token developers using PumpPortal + Helius + DexScreener
 
 Architecture:
-1. Migrated tokens → Helius WebSocket (subscribe to PumpSwap program)
-2. Token metadata (image, twitter) → DexScreener API
-3. Token creator → Pump.fun API (fallback)
+1. Token creation events → PumpPortal WebSocket (subscribeNewToken) - saves creator!
+2. Migration events → PumpPortal WebSocket (subscribeMigration)
+3. Token metadata (image, twitter) → DexScreener API
 4. Twitter handle → Twitter API (from community links)
+5. Fallback for creator → Helius parseTransaction
 """
 
 import os
@@ -35,13 +36,13 @@ from pydantic import BaseModel
 import uvicorn
 
 # Configuration
-PUMPFUN_API_URL = "https://frontend-api.pump.fun"
+PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data"
 PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "14649a76-7c70-443c-b6da-41cffe2543fd")
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-HELIUS_WS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+HELIUS_API_URL = f"https://api.helius.xyz/v0"
 TWITTER_API_KEY = "new1_defb379335c44d58890c0e2c59ada78f"
-DEXSCREENER_API_URL = "https://api.dexscreener.com"  # No API key needed
+DEXSCREENER_API_URL = "https://api.dexscreener.com"
 DATABASE_URL = os.getenv("DATABASE_URL", None)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "dev_intel.db")
 USE_POSTGRES = DATABASE_URL is not None and POSTGRES_AVAILABLE
@@ -53,7 +54,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database setup
+# ============== Database Setup ==============
+
 def init_database():
     """Initialize database with required tables"""
     if USE_POSTGRES:
@@ -64,7 +66,7 @@ def init_database():
     cursor = conn.cursor()
     
     if USE_POSTGRES:
-        DatabaseOps.execute(cursor, '''
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS tokens (
                 mint TEXT PRIMARY KEY,
                 name TEXT,
@@ -83,7 +85,7 @@ def init_database():
             )
         ''')
         
-        DatabaseOps.execute(cursor, '''
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS developers (
                 wallet TEXT PRIMARY KEY,
                 twitter_handle TEXT,
@@ -97,19 +99,23 @@ def init_database():
             )
         ''')
         
-        DatabaseOps.execute(cursor, '''
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS events (
                 id SERIAL PRIMARY KEY,
                 event_type TEXT,
                 dev_wallet TEXT,
                 token_mint TEXT,
                 data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                processed BOOLEAN DEFAULT FALSE
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        
+        # Create indexes
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tokens_creator ON tokens(creator_wallet)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tokens_graduated ON tokens(is_graduated)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)')
     else:
-        DatabaseOps.execute(cursor, '''
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS tokens (
                 mint TEXT PRIMARY KEY,
                 name TEXT,
@@ -120,298 +126,103 @@ def init_database():
                 website_link TEXT,
                 description TEXT,
                 image_uri TEXT,
-                is_graduated BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP,
-                graduated_at TIMESTAMP,
+                is_graduated INTEGER DEFAULT 0,
+                created_at TEXT,
+                graduated_at TEXT,
                 market_cap REAL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        DatabaseOps.execute(cursor, '''
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS developers (
                 wallet TEXT PRIMARY KEY,
                 twitter_handle TEXT,
                 total_tokens INTEGER DEFAULT 0,
                 graduated_tokens INTEGER DEFAULT 0,
                 migration_percentage REAL DEFAULT 0,
-                last_migration_at TIMESTAMP,
-                last_token_launch_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                last_migration_at TEXT,
+                last_token_launch_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        DatabaseOps.execute(cursor, '''
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT,
                 dev_wallet TEXT,
                 token_mint TEXT,
                 data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                processed BOOLEAN DEFAULT 0
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-    
-    # Create indexes
-    if USE_POSTGRES:
-        try:
-            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_tokens_creator ON tokens(creator_wallet)')
-            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_tokens_graduated ON tokens(is_graduated)')
-            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_tokens_created ON tokens(created_at DESC)')
-            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_devs_percentage ON developers(migration_percentage DESC)')
-            DatabaseOps.execute(cursor, 'CREATE INDEX IF NOT EXISTS idx_devs_tokens ON developers(total_tokens)')
-        except Exception as e:
-            logger.warning(f"Index creation warning: {e}")
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tokens_creator ON tokens(creator_wallet)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tokens_graduated ON tokens(is_graduated)')
     
     conn.commit()
     conn.close()
-    db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
-    logger.info(f"Database initialized successfully ({db_type})")
+    logger.info(f"Database initialized ({'PostgreSQL' if USE_POSTGRES else 'SQLite'})")
 
 
-class PumpFunClient:
-    """Client for Pump.fun API"""
+# ============== API Clients ==============
+
+class DexScreenerClient:
+    """Client for DexScreener API - get token info, image, socials"""
     
-    def __init__(self, base_url: str):
-        self.base_url = base_url
+    def __init__(self):
+        self.base_url = "https://api.dexscreener.com"
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; PumpTracker/1.0)",
-            "Accept": "application/json"
+            "accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; PumpTracker/1.0)"
         })
     
     def get_token_info(self, mint: str) -> Optional[Dict]:
-        """Get token info including creator from pump.fun API"""
+        """Get token info from DexScreener including image and socials"""
         try:
-            response = self.session.get(
-                f"{self.base_url}/coins/{mint}",
-                timeout=10
-            )
+            url = f"{self.base_url}/latest/dex/tokens/{mint}"
+            response = self.session.get(url, timeout=15)
+            
             if response.status_code == 200:
-                return response.json()
-            return None
-        except Exception as e:
-            logger.error(f"Error fetching token info for {mint}: {e}")
-            return None
-    
-    def get_wallet_token_count(self, wallet: str) -> int:
-        """Get total token count for a wallet using balances endpoint with pagination"""
-        total_count = 0
-        offset = 0
-        limit = 200
-        
-        try:
-            while True:
-                response = self.session.get(
-                    f"{self.base_url}/balances/{wallet}",
-                    params={"limit": limit, "offset": offset},
-                    timeout=30
-                )
-                
-                if response.status_code != 200:
-                    logger.warning(f"Balances API returned {response.status_code} for {wallet}")
-                    break
-                
                 data = response.json()
+                pairs = data.get("pairs", [])
                 
-                if isinstance(data, list):
-                    batch_count = len(data)
-                    total_count += batch_count
+                if pairs:
+                    pair = pairs[0]
+                    base_token = pair.get("baseToken", {})
+                    info = pair.get("info", {})
+                    socials = info.get("socials", [])
                     
-                    if batch_count < limit:
-                        break
-                    offset += limit
-                elif isinstance(data, dict):
-                    # API might return {total: X, items: [...]}
-                    if "total" in data:
-                        return data["total"]
-                    items = data.get("items", data.get("balances", []))
-                    batch_count = len(items)
-                    total_count += batch_count
+                    # Find twitter/community link
+                    twitter_link = None
+                    website_link = None
+                    for social in socials:
+                        if social.get("type") == "twitter":
+                            twitter_link = social.get("url")
+                        elif social.get("type") == "website":
+                            website_link = social.get("url")
                     
-                    if batch_count < limit:
-                        break
-                    offset += limit
-                else:
-                    break
-                
-                # Safety limit
-                if offset > 10000:
-                    logger.warning(f"Hit safety limit for wallet {wallet}")
-                    break
+                    result = {
+                        "mint": mint,
+                        "name": base_token.get("name"),
+                        "symbol": base_token.get("symbol"),
+                        "image_uri": info.get("imageUrl"),
+                        "twitter": twitter_link,
+                        "website": website_link,
+                        "price_usd": pair.get("priceUsd"),
+                        "market_cap": pair.get("marketCap") or pair.get("fdv"),
+                        "dex_id": pair.get("dexId")
+                    }
                     
-        except Exception as e:
-            logger.error(f"Error fetching token count for {wallet}: {e}")
-        
-        return total_count
-    
-    def fetch_user_created_coins(self, wallet: str, limit: int = 500) -> Dict:
-        """Fetch coins created by user (fallback, has 500 limit)"""
-        try:
-            response = self.session.get(
-                f"{self.base_url}/coins/user-created-coins/{wallet}",
-                params={"limit": limit, "offset": 0, "includeNsfw": "true"},
-                timeout=30
-            )
-            if response.status_code == 404:
-                return {"coins": [], "count": 0}
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data, dict):
-                return data
-            return {"coins": [], "count": 0}
-        except Exception as e:
-            logger.error(f"Error fetching user coins for {wallet}: {e}")
-            return {"coins": [], "count": 0}
-    
-    def fetch_with_retry(self, url: str, params: Dict = None, max_retries: int = 5) -> Optional[Dict]:
-        """Fetch URL with retry logic for rate limiting"""
-        for attempt in range(max_retries):
-            try:
-                response = self.session.get(url, params=params, timeout=30)
-                
-                if response.status_code == 200:
-                    return response.json()
-                
-                if response.status_code in [429, 503, 530, 1016]:  # Rate limit / Cloudflare
-                    wait_time = 60 * (attempt + 1)  # 60s, 120s, 180s...
-                    logger.warning(f"Rate limited ({response.status_code}), waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                
-                logger.warning(f"API returned {response.status_code} for {url}")
-                return None
-                
-            except Exception as e:
-                logger.error(f"Request error (attempt {attempt+1}): {e}")
-                time.sleep(10)
-        
-        return None
-    
-    def get_graduated_tokens(self, limit: int = 50, offset: int = 0) -> List[Dict]:
-        """Get graduated (completed) tokens from pump.fun API"""
-        try:
-            # Use completed=true filter to get only graduated tokens
-            params = {
-                "limit": limit,
-                "offset": offset,
-                "sort": "last_trade_timestamp",
-                "order": "DESC",
-                "includeNsfw": "true",
-                "completed": "true"  # Only graduated tokens
-            }
-            
-            data = self.fetch_with_retry(f"{self.base_url}/coins", params=params)
-            
-            if data and isinstance(data, list):
-                return data
-            elif data and isinstance(data, dict):
-                return data.get("coins", data.get("items", []))
-            return []
-            
-        except Exception as e:
-            logger.error(f"Error fetching graduated tokens: {e}")
-            return []
-    
-    def get_king_of_hill_tokens(self) -> List[Dict]:
-        """Get king-of-the-hill tokens (recently graduated)"""
-        try:
-            data = self.fetch_with_retry(
-                f"{self.base_url}/coins/king-of-the-hill",
-                params={"includeNsfw": "true"}
-            )
-            
-            if data and isinstance(data, list):
-                return data
-            return []
-            
-        except Exception as e:
-            logger.error(f"Error fetching king-of-hill tokens: {e}")
-            return []
-
-
-class HeliusClient:
-    """Client for Helius RPC and WebSocket API"""
-    
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
-        self.ws_url = f"wss://mainnet.helius-rpc.com/?api-key={api_key}"
-        self.session = requests.Session()
-    
-    def get_transactions_for_address(self, address: str, before: str = None, limit: int = 100) -> List[Dict]:
-        """Get transaction history for an address (without type filter to get all transactions)"""
-        try:
-            url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
-            params = {"api-key": self.api_key, "limit": limit}
-            if before:
-                params["before"] = before
-            
-            response = self.session.get(url, params=params, timeout=30)
-            if response.status_code == 200:
-                txs = response.json()
-                logger.info(f"Helius API returned {len(txs)} transactions")
-                return txs
-            else:
-                logger.error(f"Helius API error: {response.status_code}")
-            return []
-        except Exception as e:
-            logger.error(f"Error fetching transactions: {e}")
-            return []
-    
-    def find_pump_token_in_transaction(self, tx: Dict) -> Optional[str]:
-        """Find pump token mint address in a transaction using multiple methods"""
-        try:
-            # Method 1: Through tokenTransfers (primary)
-            if "tokenTransfers" in tx:
-                for transfer in tx["tokenTransfers"]:
-                    mint = transfer.get("mint", "")
-                    if mint.endswith("pump"):
-                        return mint
-            
-            # Method 2: Through accountData tokenBalanceChanges
-            if "accountData" in tx:
-                for account in tx["accountData"]:
-                    # Check tokenBalanceChanges
-                    for change in account.get("tokenBalanceChanges", []):
-                        mint = change.get("mint", "")
-                        if mint.endswith("pump"):
-                            return mint
-                    # Check tokenMint field
-                    token_mint = account.get("tokenMint", "")
-                    if token_mint.endswith("pump"):
-                        return token_mint
-            
-            # Method 3: Through instructions accounts
-            if "instructions" in tx:
-                for ix in tx["instructions"]:
-                    for account in ix.get("accounts", []):
-                        if isinstance(account, str) and account.endswith("pump"):
-                            return account
-            
+                    logger.info(f"[DexScreener] Got info for {mint[:8]}...: {result.get('symbol')}")
+                    return result
+                    
             return None
         except Exception as e:
-            logger.error(f"Error finding pump token: {e}")
-            return None
-    
-    def parse_migration_transaction(self, tx: Dict) -> Optional[Dict]:
-        """Parse a transaction to extract migration info from Helius REST API format"""
-        try:
-            token_mint = self.find_pump_token_in_transaction(tx)
-            
-            if token_mint:
-                return {
-                    "token_mint": token_mint,
-                    "signature": tx.get("signature"),
-                    "slot": tx.get("slot"),
-                    "timestamp": tx.get("timestamp"),
-                    "type": tx.get("type", "UNKNOWN")
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Error parsing transaction: {e}")
+            logger.error(f"[DexScreener] Error getting token info: {e}")
             return None
 
 
@@ -447,107 +258,66 @@ class TwitterClient:
             return None
 
 
-class DexScreenerClient:
-    """Client for DexScreener API - get token info, image, socials"""
+class HeliusClient:
+    """Client for Helius API - parse transactions"""
     
-    def __init__(self):
-        self.base_url = "https://api.dexscreener.com"
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = f"https://api.helius.xyz/v0"
+        self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
         self.session = requests.Session()
-        self.session.headers.update({
-            "accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (compatible; PumpTracker/1.0)"
-        })
     
-    def get_token_info(self, mint: str) -> Optional[Dict]:
-        """Get token info from DexScreener including image and socials"""
+    def parse_transaction(self, signature: str) -> Optional[Dict]:
+        """Parse a transaction to get details"""
         try:
-            url = f"{self.base_url}/latest/dex/tokens/{mint}"
-            response = self.session.get(url, timeout=15)
+            url = f"{self.base_url}/transactions/?api-key={self.api_key}"
+            response = self.session.post(
+                url,
+                json={"transactions": [signature]},
+                timeout=15
+            )
             
             if response.status_code == 200:
                 data = response.json()
-                pairs = data.get("pairs", [])
-                
-                if pairs:
-                    pair = pairs[0]  # Get first pair (usually PumpSwap)
-                    base_token = pair.get("baseToken", {})
-                    info = pair.get("info", {})
-                    socials = info.get("socials", [])
-                    
-                    # Find twitter/community link
-                    twitter_link = None
-                    for social in socials:
-                        if social.get("type") == "twitter":
-                            twitter_link = social.get("url")
-                            break
-                    
-                    result = {
-                        "mint": mint,
-                        "name": base_token.get("name"),
-                        "symbol": base_token.get("symbol"),
-                        "image_uri": info.get("imageUrl"),
-                        "twitter": twitter_link,
-                        "price_usd": pair.get("priceUsd"),
-                        "market_cap": pair.get("marketCap") or pair.get("fdv"),
-                        "dex_id": pair.get("dexId")
-                    }
-                    
-                    logger.info(f"[DexScreener] Got info for {mint[:8]}...: {result.get('symbol')}")
-                    return result
-                    
+                if data and len(data) > 0:
+                    return data[0]
             return None
         except Exception as e:
-            logger.error(f"[DexScreener] Error getting token info: {e}")
+            logger.error(f"[Helius] Error parsing transaction: {e}")
             return None
     
-    def get_token_creator_from_first_trade(self, mint: str) -> Optional[str]:
-        """Try to get creator from first trade - not reliable, use Helius instead"""
-        # DexScreener doesn't provide creator info directly
-        # We'll use Helius for this
-        return None
-
-
-def extract_twitter_handle(url: str) -> Optional[str]:
-    if not url:
-        return None
-    patterns = [
-        r'(?:twitter\.com|x\.com)/([a-zA-Z0-9_]+)/status',
-        r'(?:twitter\.com|x\.com)/([a-zA-Z0-9_]+)/?$',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            handle = match.group(1)
-            if handle.lower() not in ['i', 'intent', 'share', 'hashtag']:
-                return handle
-    return None
+    def get_token_transactions(self, mint: str, limit: int = 100) -> List[Dict]:
+        """Get transactions for a token"""
+        try:
+            url = f"{self.base_url}/addresses/{mint}/transactions?api-key={self.api_key}&limit={limit}"
+            response = self.session.get(url, timeout=15)
+            
+            if response.status_code == 200:
+                return response.json()
+            return []
+        except Exception as e:
+            logger.error(f"[Helius] Error getting transactions: {e}")
+            return []
 
 
 # Initialize clients
-pumpfun_client = PumpFunClient(PUMPFUN_API_URL)
-helius_client = HeliusClient(HELIUS_API_KEY)
-twitter_client = TwitterClient(TWITTER_API_KEY)
 dexscreener_client = DexScreenerClient()
+twitter_client = TwitterClient(TWITTER_API_KEY)
+helius_client = HeliusClient(HELIUS_API_KEY)
 
+
+# ============== Database Operations ==============
 
 class DatabaseOps:
     @staticmethod
     def get_connection():
         if USE_POSTGRES:
             return psycopg2.connect(DATABASE_URL)
-        else:
-            return sqlite3.connect(DATABASE_PATH)
+        return sqlite3.connect(DATABASE_PATH)
     
     @staticmethod
-    def execute(cursor, query, params=None):
+    def execute(cursor, query: str, params: tuple = None):
         if USE_POSTGRES:
-            # Only convert boolean comparisons for is_graduated and processed fields
-            # Use regex-like specific replacements to avoid breaking numeric comparisons
-            query = query.replace('is_graduated = 0', 'is_graduated = FALSE')
-            query = query.replace('is_graduated = 1', 'is_graduated = TRUE')
-            query = query.replace('processed = 0', 'processed = FALSE')
-            query = query.replace('processed = 1', 'processed = TRUE')
-            query = query.replace("'%", "'%%").replace("%'", "%%'")
             query = query.replace('?', '%s')
             if 'INSERT OR REPLACE INTO tokens' in query:
                 query = query.replace('INSERT OR REPLACE INTO tokens', 
@@ -600,7 +370,7 @@ class DatabaseOps:
                 token_data.get("description"),
                 token_data.get("image_uri"),
                 is_graduated,
-                token_data.get("created_timestamp"),
+                token_data.get("created_timestamp") or token_data.get("created_at"),
                 graduated_at,
                 token_data.get("usd_market_cap") or token_data.get("market_cap")
             ))
@@ -628,32 +398,26 @@ class DatabaseOps:
         return None
     
     @staticmethod
-    def update_developer_stats(wallet: str):
-        """Update developer statistics using pump.fun balances API for accurate count"""
+    def update_developer_stats(wallet: str, increment_total: bool = False):
+        """Update developer statistics"""
         try:
             conn = DatabaseOps.get_connection()
             cursor = conn.cursor()
             
-            # Get total token count from pump.fun balances API (no 500 limit)
-            total_tokens = pumpfun_client.get_wallet_token_count(wallet)
+            # Count total tokens created by this wallet
+            DatabaseOps.execute(cursor, '''
+                SELECT COUNT(*) FROM tokens WHERE creator_wallet = ?
+            ''', (wallet,))
+            total_tokens = cursor.fetchone()[0]
             
-            # If balances API fails, fall back to user-created-coins
-            if total_tokens == 0:
-                api_response = pumpfun_client.fetch_user_created_coins(wallet)
-                total_tokens = api_response.get("count", 0)
-                # Save tokens to database
-                for token in api_response.get("coins", []):
-                    if isinstance(token, dict):
-                        DatabaseOps.save_token(token)
-            
-            # Count graduated tokens from database
+            # Count graduated tokens
             DatabaseOps.execute(cursor, '''
                 SELECT COUNT(*) FROM tokens 
                 WHERE creator_wallet = ? AND is_graduated = 1
             ''', (wallet,))
-            result = cursor.fetchone()
-            graduated_tokens = result[0] if result else 0
+            graduated_tokens = cursor.fetchone()[0]
             
+            # Calculate migration percentage
             migration_percentage = (graduated_tokens / total_tokens * 100) if total_tokens > 0 else 0
             
             # Get last migration time
@@ -698,53 +462,24 @@ class DatabaseOps:
             conn.close()
             logger.info(f"Updated dev {wallet[:8]}...: {graduated_tokens}/{total_tokens} = {migration_percentage:.1f}%")
         except Exception as e:
-            logger.error(f"Error updating developer stats for {wallet[:8]}...: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"Error updating developer stats: {e}")
     
     @staticmethod
-    def get_developer(wallet: str) -> Optional[Dict]:
+    def get_top_developers(sort_by: str = "percentage", limit: int = 50) -> List[Dict]:
         conn = DatabaseOps.get_connection()
         cursor = conn.cursor()
-        DatabaseOps.execute(cursor, 'SELECT * FROM developers WHERE wallet = ?', (wallet,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            return {
-                "wallet": row[0], "twitter_handle": row[1],
-                "total_tokens": row[2], "graduated_tokens": row[3],
-                "migration_percentage": row[4], "last_migration_at": row[5],
-                "last_token_launch_at": row[6]
-            }
-        return None
-    
-    @staticmethod
-    def get_top_devs_by_percentage(limit: int = 50) -> List[Dict]:
-        conn = DatabaseOps.get_connection()
-        cursor = conn.cursor()
-        DatabaseOps.execute(cursor, '''
-            SELECT * FROM developers 
-            WHERE total_tokens >= 2
-            ORDER BY migration_percentage DESC, graduated_tokens DESC
-            LIMIT ?
-        ''', (limit,))
-        rows = cursor.fetchall()
-        conn.close()
-        return [{
-            "wallet": row[0], "twitter_handle": row[1],
-            "total_tokens": row[2], "migrated_tokens": row[3],
-            "migration_percentage": row[4], "last_migration_at": row[5],
-            "last_token_launch_at": row[6]
-        } for row in rows]
-    
-    @staticmethod
-    def get_top_devs_by_count(limit: int = 50) -> List[Dict]:
-        conn = DatabaseOps.get_connection()
-        cursor = conn.cursor()
-        DatabaseOps.execute(cursor, '''
-            SELECT * FROM developers 
-            WHERE graduated_tokens >= 1
-            ORDER BY graduated_tokens DESC, migration_percentage DESC
+        
+        if sort_by == "percentage":
+            order = "migration_percentage DESC, graduated_tokens DESC"
+        else:
+            order = "graduated_tokens DESC, migration_percentage DESC"
+        
+        DatabaseOps.execute(cursor, f'''
+            SELECT wallet, twitter_handle, total_tokens, graduated_tokens, 
+                   migration_percentage, last_migration_at, last_token_launch_at
+            FROM developers 
+            WHERE graduated_tokens > 0
+            ORDER BY {order}
             LIMIT ?
         ''', (limit,))
         rows = cursor.fetchall()
@@ -790,401 +525,293 @@ class DatabaseOps:
             conn.close()
         except Exception as e:
             logger.error(f"Error adding event: {e}")
+    
+    @staticmethod
+    def get_recent_events(limit: int = 50) -> List[Dict]:
+        conn = DatabaseOps.get_connection()
+        cursor = conn.cursor()
+        DatabaseOps.execute(cursor, '''
+            SELECT id, event_type, dev_wallet, token_mint, data, created_at
+            FROM events ORDER BY created_at DESC LIMIT ?
+        ''', (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [{
+            "id": row[0], "event_type": row[1], "dev_wallet": row[2],
+            "token_mint": row[3], "data": json.loads(row[4]) if row[4] else {},
+            "created_at": row[5]
+        } for row in rows]
+    
+    @staticmethod
+    def get_db_stats() -> Dict:
+        conn = DatabaseOps.get_connection()
+        cursor = conn.cursor()
+        
+        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens')
+        total_tokens = cursor.fetchone()[0]
+        
+        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens WHERE is_graduated = 1')
+        graduated_tokens = cursor.fetchone()[0]
+        
+        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM developers')
+        total_devs = cursor.fetchone()[0]
+        
+        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM developers WHERE graduated_tokens > 0')
+        active_devs = cursor.fetchone()[0]
+        
+        conn.close()
+        return {
+            "total_tokens": total_tokens,
+            "graduated_tokens": graduated_tokens,
+            "total_developers": total_devs,
+            "active_developers": active_devs
+        }
 
 
-# Helius WebSocket for real-time migration tracking
-async def helius_websocket_listener():
-    """Listen to Helius WebSocket for PumpSwap migrations"""
-    logger.info(f"Starting Helius WebSocket listener for PumpSwap: {PUMPSWAP_PROGRAM}")
+# ============== PumpPortal WebSocket ==============
+
+async def pumpportal_websocket_listener():
+    """Listen to PumpPortal WebSocket for token creation and migration events"""
+    logger.info("Starting PumpPortal WebSocket listener...")
     
     reconnect_delay = 1
     max_reconnect_delay = 60
     
     while True:
         try:
-            async with websockets.connect(HELIUS_WS_URL) as ws:
-                logger.info("Connected to Helius WebSocket")
+            async with websockets.connect(PUMPPORTAL_WS_URL) as ws:
+                logger.info("Connected to PumpPortal WebSocket")
                 reconnect_delay = 1
                 
-                # Subscribe to PumpSwap program logs
-                subscribe_msg = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "logsSubscribe",
-                    "params": [
-                        {"mentions": [PUMPSWAP_PROGRAM]},
-                        {"commitment": "confirmed"}
-                    ]
-                }
-                await ws.send(json.dumps(subscribe_msg))
-                logger.info(f"Subscribed to PumpSwap program: {PUMPSWAP_PROGRAM}")
+                # Subscribe to new token events (includes creator!)
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                logger.info("Subscribed to subscribeNewToken")
                 
-                # Ping task to keep connection alive
-                async def ping_task():
-                    while True:
-                        try:
-                            await asyncio.sleep(30)
-                            await ws.ping()
-                        except:
-                            break
+                # Subscribe to migration events
+                await ws.send(json.dumps({"method": "subscribeMigration"}))
+                logger.info("Subscribed to subscribeMigration")
                 
-                ping = asyncio.create_task(ping_task())
-                
-                try:
-                    async for message in ws:
-                        try:
-                            data = json.loads(message)
-                            
-                            # Handle subscription confirmation
-                            if "result" in data and isinstance(data["result"], int):
-                                logger.info(f"Subscription confirmed: {data['result']}")
-                                continue
-                            
-                            # Handle log notifications
-                            if "method" in data and data["method"] == "logsNotification":
-                                await process_migration_log(data)
-                        except json.JSONDecodeError:
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        
+                        # Skip confirmation messages
+                        if "message" in data:
+                            logger.info(f"PumpPortal: {data['message']}")
                             continue
-                        except Exception as e:
-                            logger.error(f"Error processing message: {e}")
-                finally:
-                    ping.cancel()
-                    
+                        
+                        # Handle token creation
+                        if data.get("txType") == "create":
+                            await process_token_creation(data)
+                        
+                        # Handle migration
+                        elif data.get("txType") == "migrate":
+                            await process_migration(data)
+                            
+                    except json.JSONDecodeError:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing PumpPortal message: {e}")
+                        
         except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"WebSocket connection closed: {e}")
+            logger.warning(f"PumpPortal WebSocket closed: {e}")
         except Exception as e:
-            logger.error(f"WebSocket error: {e}")
+            logger.error(f"PumpPortal WebSocket error: {e}")
         
-        logger.info(f"Reconnecting in {reconnect_delay}s...")
+        logger.info(f"Reconnecting to PumpPortal in {reconnect_delay}s...")
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
 
-async def process_migration_log(data: Dict):
-    """Process a migration log from Helius WebSocket"""
+async def process_token_creation(data: Dict):
+    """Process token creation event from PumpPortal"""
     try:
-        params = data.get("params", {})
-        result = params.get("result", {})
-        value = result.get("value", {})
+        mint = data.get("mint")
+        creator = data.get("traderPublicKey")
+        name = data.get("name")
+        symbol = data.get("symbol")
+        uri = data.get("uri")
+        market_cap = data.get("marketCapSol")
         
-        signature = value.get("signature")
-        logs = value.get("logs", [])
-        
-        # Look for migration-related logs
-        is_migration = False
-        for log in logs:
-            if "migrate" in log.lower() or "graduation" in log.lower():
-                is_migration = True
-                break
-        
-        if not is_migration:
+        if not mint or not creator:
             return
         
-        logger.info(f"🚀 Migration detected! Signature: {signature}")
+        logger.info(f"🆕 New token: {symbol} ({mint[:8]}...) by {creator[:8]}...")
         
-        # Fetch full transaction to get token details
-        # Use Helius parsed transaction API
-        try:
-            response = requests.post(
-                HELIUS_RPC_URL,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "getTransaction",
-                    "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-                },
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                tx_data = response.json().get("result", {})
-                await extract_and_save_migration(tx_data, signature)
-        except Exception as e:
-            logger.error(f"Error fetching transaction {signature}: {e}")
-            
+        # Save token with creator
+        token_data = {
+            "mint": mint,
+            "name": name,
+            "symbol": symbol,
+            "creator": creator,
+            "image_uri": uri,  # Will be enriched later
+            "market_cap": market_cap,
+            "created_at": datetime.utcnow().isoformat(),
+            "is_graduated": False
+        }
+        DatabaseOps.save_token(token_data)
+        
+        # Update developer stats
+        DatabaseOps.update_developer_stats(creator, increment_total=True)
+        
+        # Add event
+        DatabaseOps.add_event("token_created", creator, mint, {
+            "symbol": symbol,
+            "name": name
+        })
+        
     except Exception as e:
-        logger.error(f"Error processing migration log: {e}")
+        logger.error(f"Error processing token creation: {e}")
 
 
-async def extract_and_save_migration(tx_data: Dict, signature: str):
-    """Extract token info from migration transaction and save"""
+async def process_migration(data: Dict):
+    """Process migration event from PumpPortal"""
     try:
-        if not tx_data:
-            logger.warning(f"No transaction data for {signature}")
-            return
-            
-        meta = tx_data.get("meta") or {}
-        post_token_balances = meta.get("postTokenBalances") or []
+        mint = data.get("mint")
+        signature = data.get("signature")
+        pool = data.get("pool")  # "pump-amm"
         
-        # Find the pump token
-        token_mint = None
-        for balance in post_token_balances:
-            mint = balance.get("mint", "")
-            if mint.endswith("pump"):
-                token_mint = mint
-                break
-        
-        if not token_mint:
-            logger.warning(f"No pump token found in tx {signature}")
+        if not mint:
             return
         
-        logger.info(f"Found migrated token: {token_mint}")
+        logger.info(f"🚀 Migration detected: {mint[:8]}... to {pool}")
         
-        # Get token creator - try pump.fun first, then Moralis as fallback
-        token_info = pumpfun_client.get_token_info(token_mint)
-        creator = None
+        # Check if we have this token in DB (with creator)
+        existing_token = DatabaseOps.get_token(mint)
+        creator = existing_token.get("creator_wallet") if existing_token else None
         
-        if token_info:
-            creator = token_info.get("creator")
-            # Save token as graduated
-            token_info["complete"] = True
-            token_info["graduated_at"] = datetime.utcnow().isoformat()
-            DatabaseOps.save_token(token_info)
-        else:
-            logger.warning(f"Pump.fun API failed for {token_mint}, trying Moralis...")
-            # Fallback to Moralis for creator
-            creator = moralis_client.get_token_creator(token_mint)
-            
-            if creator:
-                # Get metadata from Moralis
-                moralis_meta = moralis_client.get_token_metadata(token_mint)
-                token_info = {
-                    "mint": token_mint,
-                    "name": moralis_meta.get("name") if moralis_meta else f"Token {token_mint[:8]}...",
-                    "symbol": moralis_meta.get("symbol") if moralis_meta else "???",
-                    "creator": creator,
-                    "complete": True,
-                    "is_graduated": True,
-                    "graduated_at": datetime.utcnow().isoformat()
-                }
-                DatabaseOps.save_token(token_info)
-                logger.info(f"[Moralis] Got creator for {token_mint[:8]}...: {creator[:8]}...")
+        # Get token info from DexScreener
+        dex_info = dexscreener_client.get_token_info(mint)
         
+        # Prepare token data
+        token_data = {
+            "mint": mint,
+            "name": dex_info.get("name") if dex_info else (existing_token.get("name") if existing_token else f"Token {mint[:8]}..."),
+            "symbol": dex_info.get("symbol") if dex_info else (existing_token.get("symbol") if existing_token else "???"),
+            "creator": creator,
+            "image_uri": dex_info.get("image_uri") if dex_info else (existing_token.get("image_uri") if existing_token else None),
+            "twitter": dex_info.get("twitter") if dex_info else (existing_token.get("twitter_link") if existing_token else None),
+            "website": dex_info.get("website") if dex_info else (existing_token.get("website_link") if existing_token else None),
+            "market_cap": dex_info.get("market_cap") if dex_info else (existing_token.get("market_cap") if existing_token else None),
+            "is_graduated": True,
+            "complete": True,
+            "graduated_at": datetime.utcnow().isoformat()
+        }
+        
+        # If no creator, try to find from Helius
+        if not creator:
+            logger.info(f"No creator in DB for {mint[:8]}..., trying Helius...")
+            tx_data = helius_client.parse_transaction(signature)
+            if tx_data:
+                # feePayer might be the creator or a bot
+                creator = tx_data.get("feePayer")
+                token_data["creator"] = creator
+        
+        # Save token
+        DatabaseOps.save_token(token_data)
+        
+        # Update developer stats if we have creator
         if creator:
-            # Update developer stats
             DatabaseOps.update_developer_stats(creator)
             
             # Add event
-            DatabaseOps.add_event("migration", creator, token_mint, {
-                "symbol": token_info.get("symbol") if token_info else "???",
-                "name": token_info.get("name") if token_info else f"Token {token_mint[:8]}...",
-                "signature": signature
+            DatabaseOps.add_event("migration", creator, mint, {
+                "symbol": token_data.get("symbol"),
+                "name": token_data.get("name"),
+                "signature": signature,
+                "pool": pool
             })
             
-            logger.info(f"✅ Saved migration: {token_info.get('symbol') if token_info else token_mint[:8]} by {creator[:8]}...")
+            logger.info(f"✅ Saved migration: {token_data.get('symbol')} by {creator[:8]}...")
         else:
-            logger.warning(f"Could not get creator for {token_mint} from any source")
+            logger.warning(f"Could not find creator for {mint}")
             
     except Exception as e:
-        logger.error(f"Error extracting migration: {e}")
+        logger.error(f"Error processing migration: {e}")
 
 
-# Historical migration loader - HELIUS ONLY (no pump.fun dependency)
-async def load_historical_migrations():
-    """Load historical migrations from Helius API only (pump.fun blocked)"""
-    logger.info("=== Starting historical migrations load (Helius-only) ===")
-    
-    # Load existing tokens to avoid duplicates
-    try:
-        conn = DatabaseOps.get_connection()
-        cursor = conn.cursor()
-        DatabaseOps.execute(cursor, 'SELECT mint FROM tokens WHERE is_graduated = 1')
-        existing_mints = set(row[0] for row in cursor.fetchall())
-        conn.close()
-        logger.info(f"Found {len(existing_mints)} existing migrated tokens in DB")
-    except Exception as e:
-        logger.error(f"Error loading existing tokens: {e}")
-        existing_mints = set()
-    
-    # If we already have tokens, skip historical load
-    if len(existing_mints) > 100:
-        logger.info("Skipping historical load - database already populated")
-        return
-    
-    # Use Helius API to get PumpSwap transactions
-    logger.info(f"Fetching PumpSwap transactions from Helius API...")
-    logger.info(f"Program: {PUMPSWAP_PROGRAM}")
-    
-    total_loaded = 0
-    before = None
-    max_pages = 100  # Up to 10,000 transactions
-    unique_tokens = set()
-    
-    for page in range(max_pages):
-        try:
-            logger.info(f"Requesting page {page} from Helius...")
-            
-            txs = helius_client.get_transactions_for_address(PUMPSWAP_PROGRAM, before=before, limit=100)
-            
-            if not txs:
-                logger.info(f"No more transactions at page {page}")
-                break
-            
-            logger.info(f"Got {len(txs)} transactions from Helius")
-            
-            # Debug first transaction on first page
-            if page == 0 and txs:
-                first_tx = txs[0]
-                logger.info(f"First tx keys: {list(first_tx.keys())}")
-                logger.info(f"First tx type: {first_tx.get('type')}")
-            
-            page_tokens = 0
-            for tx in txs:
-                # Find pump token in transaction
-                token_mint = helius_client.find_pump_token_in_transaction(tx)
-                
-                if token_mint and token_mint not in existing_mints and token_mint not in unique_tokens:
-                    unique_tokens.add(token_mint)
-                    
-                    # Save token with minimal data (Helius-only, no pump.fun)
-                    timestamp = tx.get("timestamp", int(time.time()))
-                    token_data = {
-                        "mint": token_mint,
-                        "name": f"Token {token_mint[:8]}...",  # Placeholder
-                        "symbol": "???",  # Will be enriched later
-                        "creator": None,  # Will be enriched later
-                        "complete": True,
-                        "is_graduated": True,
-                        "graduated_at": datetime.fromtimestamp(timestamp).isoformat()
-                    }
-                    
-                    DatabaseOps.save_token(token_data)
-                    total_loaded += 1
-                    page_tokens += 1
-                    
-                    if total_loaded % 50 == 0:
-                        logger.info(f"Loaded {total_loaded} migrated tokens...")
-            
-            logger.info(f"Page {page}: Found {page_tokens} new pump tokens")
-            
-            # Get cursor for next page
-            if txs:
-                before = txs[-1].get("signature")
-            
-            # Rate limiting
-            await asyncio.sleep(0.3)
-            
-        except Exception as e:
-            logger.error(f"Error loading historical migrations: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await asyncio.sleep(5)
-            continue
-    
-    logger.info(f"Historical load complete: {total_loaded} migrated tokens loaded")
-    logger.info(f"Note: Token metadata will be enriched when pump.fun API becomes available")
+# ============== Background Tasks ==============
 
-
-# Background task to enrich token data from pump.fun
 async def enrich_token_data():
-    """Try to enrich tokens that have no creator data"""
+    """Background task to enrich token data with DexScreener info"""
     while True:
         try:
-            await asyncio.sleep(60)  # Run every 1 minute
+            await asyncio.sleep(60)  # Run every minute
             
             conn = DatabaseOps.get_connection()
             cursor = conn.cursor()
-            DatabaseOps.execute(cursor, 
-                'SELECT mint FROM tokens WHERE creator_wallet IS NULL AND is_graduated = 1 LIMIT 50'
-            )
+            
+            # Find tokens without image that are graduated
+            DatabaseOps.execute(cursor, '''
+                SELECT mint FROM tokens 
+                WHERE is_graduated = 1 AND (image_uri IS NULL OR image_uri = '')
+                LIMIT 20
+            ''')
             tokens_to_enrich = [row[0] for row in cursor.fetchall()]
             conn.close()
             
             if not tokens_to_enrich:
                 continue
             
-            logger.info(f"Attempting to enrich {len(tokens_to_enrich)} tokens...")
+            logger.info(f"Enriching {len(tokens_to_enrich)} tokens...")
             
             for mint in tokens_to_enrich:
-                creator = None
-                
-                # Try pump.fun first for creator
-                pumpfun_info = pumpfun_client.get_token_info(mint)
-                if pumpfun_info and pumpfun_info.get("creator"):
-                    creator = pumpfun_info.get("creator")
-                    pumpfun_info["complete"] = True
-                    pumpfun_info["is_graduated"] = True
-                    DatabaseOps.save_token(pumpfun_info)
-                    logger.info(f"[Pump.fun] Enriched token {mint[:8]}... with creator {creator[:8]}...")
-                
-                # Get additional info from DexScreener (image, twitter)
-                dex_info = dexscreener_client.get_token_info(mint)
-                if dex_info:
-                    twitter_link = dex_info.get("twitter")
+                try:
+                    dex_info = dexscreener_client.get_token_info(mint)
+                    if dex_info:
+                        existing = DatabaseOps.get_token(mint)
+                        if existing:
+                            token_data = {
+                                "mint": mint,
+                                "name": dex_info.get("name") or existing.get("name"),
+                                "symbol": dex_info.get("symbol") or existing.get("symbol"),
+                                "creator": existing.get("creator_wallet"),
+                                "image_uri": dex_info.get("image_uri"),
+                                "twitter": dex_info.get("twitter") or existing.get("twitter_link"),
+                                "website": dex_info.get("website") or existing.get("website_link"),
+                                "market_cap": dex_info.get("market_cap") or existing.get("market_cap"),
+                                "is_graduated": existing.get("is_graduated"),
+                                "graduated_at": existing.get("graduated_at"),
+                                "created_at": existing.get("created_at")
+                            }
+                            DatabaseOps.save_token(token_data)
+                            
+                            # Try to get twitter handle from community
+                            twitter_link = dex_info.get("twitter")
+                            if twitter_link and "/i/communities/" in twitter_link:
+                                community_id = twitter_client.extract_community_id(twitter_link)
+                                if community_id and existing.get("creator_wallet"):
+                                    twitter_handle = twitter_client.get_community_admin(community_id)
+                                    if twitter_handle:
+                                        logger.info(f"Found twitter handle: @{twitter_handle}")
                     
-                    token_update = {
-                        "mint": mint,
-                        "name": dex_info.get("name") or f"Token {mint[:8]}...",
-                        "symbol": dex_info.get("symbol") or "???",
-                        "image_uri": dex_info.get("image_uri"),
-                        "twitter": twitter_link,
-                        "market_cap": dex_info.get("market_cap"),
-                        "creator": creator,  # Keep creator if we got it
-                        "complete": True,
-                        "is_graduated": True
-                    }
-                    DatabaseOps.save_token(token_update)
-                    logger.info(f"[DexScreener] Updated token {mint[:8]}... with image and twitter")
-                
-                if creator:
-                    DatabaseOps.update_developer_stats(creator)
-                    logger.info(f"Enriched token {mint[:8]}... with creator {creator[:8]}...")
-                
-                await asyncio.sleep(1)  # Rate limit
-                
+                    await asyncio.sleep(1)  # Rate limit
+                except Exception as e:
+                    logger.error(f"Error enriching {mint[:8]}...: {e}")
+                    
         except Exception as e:
-            logger.error(f"Error enriching tokens: {e}")
-            await asyncio.sleep(60)
+            logger.error(f"Error in enrich task: {e}")
 
 
-# WebSocket manager for client connections
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-    
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-    
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-    
-    async def broadcast(self, message: dict):
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except:
-                pass
+# ============== FastAPI App ==============
 
-manager = ConnectionManager()
-
-
-# FastAPI app
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Startup and shutdown events"""
     init_database()
-    logger.info("Background tasks started")
     
-    # Start Helius WebSocket listener
-    logger.info(f"Starting Helius WebSocket listener for PumpSwap: {PUMPSWAP_PROGRAM}")
-    asyncio.create_task(helius_websocket_listener())
-    
-    # Load historical migrations (only on fresh database)
-    logger.info("Scheduling historical migrations load...")
-    asyncio.create_task(load_historical_migrations())
-    
-    # Start background enrichment task (tries to get data from pump.fun when available)
-    logger.info("Starting token enrichment background task...")
+    # Start background tasks
+    asyncio.create_task(pumpportal_websocket_listener())
     asyncio.create_task(enrich_token_data())
     
+    logger.info("🚀 Server started with PumpPortal + DexScreener + Helius")
     yield
-    logger.info("Shutting down...")
+    logger.info("Server shutting down...")
+
 
 app = FastAPI(
     title="Padre Trenches Dev Intel API",
-    description="Backend for tracking Solana token developers via Helius + Pump.fun",
-    version="4.0.0",
+    version="7.0.0",
     lifespan=lifespan
 )
 
@@ -1197,298 +824,154 @@ app.add_middleware(
 )
 
 
-# Data models
-class TokenInfo(BaseModel):
-    mint: str
-    name: Optional[str] = None
-    symbol: Optional[str] = None
-    creator_wallet: Optional[str] = None
-    twitter_handle: Optional[str] = None
-    twitter_link: Optional[str] = None
-    migration_percentage: Optional[float] = None
-    migration_count: Optional[int] = None
-    last_migration_at: Optional[str] = None
-    market_cap: Optional[float] = None
+# ============== API Endpoints ==============
 
-class DevInfo(BaseModel):
-    wallet: str
-    twitter_handle: Optional[str] = None
-    total_tokens: int = 0
-    migrated_tokens: int = 0
-    migration_percentage: float = 0.0
-    last_migration_at: Optional[str] = None
-    last_token_launch_at: Optional[str] = None
-
-class TopDevsResponse(BaseModel):
-    devs: List[DevInfo]
-    updated_at: str
-
-
-# API Endpoints
 @app.get("/")
 async def root():
     return {
-        "status": "ok",
-        "service": "Padre Trenches Dev Intel API",
-        "version": "6.0.0",
-        "api": "Helius WebSocket + DexScreener + Pump.fun"
+        "name": "Padre Trenches Dev Intel API",
+        "version": "7.0.0",
+        "status": "running",
+        "api": "PumpPortal WebSocket + DexScreener + Helius",
+        "endpoints": [
+            "/api/top-devs/detailed",
+            "/api/dev/{wallet}",
+            "/api/dev/{wallet}/tokens",
+            "/api/events",
+            "/api/health",
+            "/api/stats"
+        ]
     }
+
 
 @app.get("/api/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "database": "connected",
-        "version": "6.0.0"
-    }
+async def health():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
-@app.get("/api/debug/db-stats")
-async def get_db_stats():
-    try:
-        conn = DatabaseOps.get_connection()
-        cursor = conn.cursor()
-        
-        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM developers')
-        devs_count = cursor.fetchone()[0]
-        
-        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens')
-        tokens_count = cursor.fetchone()[0]
-        
-        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM tokens WHERE is_graduated = 1')
-        graduated_count = cursor.fetchone()[0]
-        
-        DatabaseOps.execute(cursor, 'SELECT COUNT(*) FROM events')
-        events_count = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        return {
-            "status": "ok",
-            "developers_count": devs_count,
-            "tokens_count": tokens_count,
-            "graduated_tokens": graduated_count,
-            "events_count": events_count,
-            "database_type": "PostgreSQL" if USE_POSTGRES else "SQLite"
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
 
-@app.post("/api/debug/force-enrich")
-async def force_enrich_tokens(limit: int = 100):
-    """Force enrich tokens using DexScreener for metadata and Helius for creator"""
-    try:
-        conn = DatabaseOps.get_connection()
-        cursor = conn.cursor()
-        # Get tokens that need enrichment (no creator or no image)
-        DatabaseOps.execute(cursor, 
-            f'SELECT mint FROM tokens WHERE (creator_wallet IS NULL OR image_uri IS NULL) AND is_graduated = 1 LIMIT {limit}'
-        )
-        tokens_to_enrich = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        
-        if not tokens_to_enrich:
-            return {"status": "ok", "message": "No tokens to enrich", "enriched": 0}
-        
-        enriched = 0
-        failed = 0
-        
-        for mint in tokens_to_enrich:
-            try:
-                # Get token info from DexScreener (image, name, symbol, twitter)
-                dex_info = dexscreener_client.get_token_info(mint)
-                
-                if dex_info:
-                    twitter_link = dex_info.get("twitter")
-                    
-                    # Check if it's a community link
-                    community_link = None
-                    if twitter_link and "/i/communities/" in twitter_link:
-                        community_link = twitter_link
-                    
-                    # Try to get creator from pump.fun first
-                    creator = None
-                    pumpfun_info = pumpfun_client.get_token_info(mint)
-                    if pumpfun_info:
-                        creator = pumpfun_info.get("creator")
-                    
-                    # Build token info
-                    token_info = {
-                        "mint": mint,
-                        "name": dex_info.get("name") or f"Token {mint[:8]}...",
-                        "symbol": dex_info.get("symbol") or "???",
-                        "image_uri": dex_info.get("image_uri"),
-                        "twitter": twitter_link,
-                        "market_cap": dex_info.get("market_cap"),
-                        "creator": creator,
-                        "complete": True,
-                        "is_graduated": True
-                    }
-                    DatabaseOps.save_token(token_info)
-                    
-                    # Try to get twitter handle from community
-                    twitter_handle = None
-                    if community_link:
-                        community_id = twitter_client.extract_community_id(community_link)
-                        if community_id:
-                            twitter_handle = twitter_client.get_community_admin(community_id)
-                            if twitter_handle:
-                                logger.info(f"[Force-Enrich] Got twitter @{twitter_handle} from community for {mint[:8]}...")
-                    
-                    # If no community, try to extract from twitter link
-                    if not twitter_handle and twitter_link:
-                        twitter_handle = extract_twitter_handle(twitter_link)
-                    
-                    # Update developer stats if we have creator
-                    if creator:
-                        DatabaseOps.update_developer_stats(creator)
-                        
-                        # If we found twitter handle, update developer directly
-                        if twitter_handle:
-                            conn = DatabaseOps.get_connection()
-                            cursor = conn.cursor()
-                            DatabaseOps.execute(cursor, 
-                                'UPDATE developers SET twitter_handle = ? WHERE wallet = ?',
-                                (twitter_handle, creator)
-                            )
-                            conn.commit()
-                            conn.close()
-                    
-                    enriched += 1
-                    logger.info(f"[Force-Enrich] {mint[:8]}... -> creator: {creator[:8] if creator else 'N/A'}... image: {'Yes' if dex_info.get('image_uri') else 'No'} twitter: @{twitter_handle or 'N/A'}")
-                else:
-                    failed += 1
-                
-                await asyncio.sleep(0.3)  # Rate limit
-            except Exception as e:
-                logger.error(f"Error enriching {mint}: {e}")
-                failed += 1
-        
-        return {
-            "status": "ok",
-            "total": len(tokens_to_enrich),
-            "enriched": enriched,
-            "failed": failed
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+@app.get("/api/stats")
+async def get_stats():
+    return DatabaseOps.get_db_stats()
 
-@app.get("/api/token/{mint}", response_model=TokenInfo)
-async def get_token_info(mint: str):
-    token = DatabaseOps.get_token(mint)
-    
-    if not token:
-        # Try to fetch from Pump.fun API
-        token_data = pumpfun_client.get_token_info(mint)
-        if token_data:
-            DatabaseOps.save_token(token_data)
-            token = DatabaseOps.get_token(mint)
-        else:
-            raise HTTPException(status_code=404, detail="Token not found")
-    
-    dev = DatabaseOps.get_developer(token.get("creator_wallet")) if token.get("creator_wallet") else None
-    
-    return TokenInfo(
-        mint=token.get("mint"),
-        name=token.get("name"),
-        symbol=token.get("symbol"),
-        creator_wallet=token.get("creator_wallet"),
-        twitter_handle=dev.get("twitter_handle") if dev else extract_twitter_handle(token.get("twitter_link")),
-        twitter_link=token.get("twitter_link"),
-        migration_percentage=dev.get("migration_percentage") if dev else None,
-        migration_count=dev.get("graduated_tokens") if dev else None,
-        last_migration_at=dev.get("last_migration_at") if dev else None,
-        market_cap=token.get("market_cap")
-    )
-
-@app.get("/api/dev/{wallet}", response_model=DevInfo)
-async def get_dev_info(wallet: str):
-    dev = DatabaseOps.get_developer(wallet)
-    if not dev:
-        # Fetch and calculate stats
-        DatabaseOps.update_developer_stats(wallet)
-        dev = DatabaseOps.get_developer(wallet)
-        if not dev:
-            raise HTTPException(status_code=404, detail="Developer not found")
-    
-    return DevInfo(**dev)
-
-@app.get("/api/dev/{wallet}/tokens")
-async def get_dev_tokens(wallet: str, limit: int = 100):
-    dev = DatabaseOps.get_developer(wallet)
-    if not dev:
-        DatabaseOps.update_developer_stats(wallet)
-        dev = DatabaseOps.get_developer(wallet)
-    
-    tokens = DatabaseOps.get_dev_tokens(wallet, limit)
-    
-    return {
-        "developer": dev,
-        "tokens": tokens,
-        "total_count": len(tokens)
-    }
-
-@app.get("/api/top-devs/by-percentage", response_model=TopDevsResponse)
-async def get_top_devs_by_percentage(limit: int = 50):
-    devs = DatabaseOps.get_top_devs_by_percentage(limit)
-    return TopDevsResponse(
-        devs=[DevInfo(**dev) for dev in devs],
-        updated_at=datetime.utcnow().isoformat()
-    )
-
-@app.get("/api/top-devs/by-count", response_model=TopDevsResponse)
-async def get_top_devs_by_count(limit: int = 50):
-    devs = DatabaseOps.get_top_devs_by_count(limit)
-    return TopDevsResponse(
-        devs=[DevInfo(**dev) for dev in devs],
-        updated_at=datetime.utcnow().isoformat()
-    )
 
 @app.get("/api/top-devs/detailed")
-async def get_top_devs_detailed(limit: int = 50, by: str = "percentage"):
-    if by == "count":
-        devs = DatabaseOps.get_top_devs_by_count(limit)
-    else:
-        devs = DatabaseOps.get_top_devs_by_percentage(limit)
+async def get_top_devs_detailed(by: str = "percentage", limit: int = 50):
+    """Get top developers with detailed stats"""
+    developers = DatabaseOps.get_top_developers(sort_by=by, limit=limit)
+    
+    # Enrich with token images
+    for dev in developers:
+        tokens = DatabaseOps.get_dev_tokens(dev["wallet"], limit=5)
+        dev["recent_tokens"] = tokens
+        # Get first token with image
+        for token in tokens:
+            if token.get("image_uri"):
+                dev["avatar"] = token["image_uri"]
+                break
+    
+    return {"developers": developers, "count": len(developers)}
+
+
+@app.get("/api/dev/{wallet}")
+async def get_developer(wallet: str):
+    """Get developer details"""
+    conn = DatabaseOps.get_connection()
+    cursor = conn.cursor()
+    DatabaseOps.execute(cursor, 'SELECT * FROM developers WHERE wallet = ?', (wallet,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Developer not found")
     
     return {
-        "devs": devs,
-        "updated_at": datetime.utcnow().isoformat()
+        "wallet": row[0], "twitter_handle": row[1],
+        "total_tokens": row[2], "migrated_tokens": row[3],
+        "migration_percentage": row[4], "last_migration_at": row[5],
+        "last_token_launch_at": row[6]
     }
+
+
+@app.get("/api/dev/{wallet}/tokens")
+async def get_developer_tokens(wallet: str, limit: int = 100):
+    """Get tokens created by a developer"""
+    tokens = DatabaseOps.get_dev_tokens(wallet, limit)
+    return {"tokens": tokens, "count": len(tokens)}
+
 
 @app.get("/api/events")
 async def get_events(limit: int = 50):
+    """Get recent events"""
+    events = DatabaseOps.get_recent_events(limit)
+    return {"events": events, "count": len(events)}
+
+
+@app.post("/api/debug/force-enrich")
+async def force_enrich(limit: int = 50):
+    """Force enrich tokens with DexScreener data"""
     conn = DatabaseOps.get_connection()
     cursor = conn.cursor()
+    
     DatabaseOps.execute(cursor, '''
-        SELECT * FROM events 
-        WHERE processed = 0 
-        ORDER BY created_at DESC 
+        SELECT mint FROM tokens 
+        WHERE is_graduated = 1
+        ORDER BY graduated_at DESC
         LIMIT ?
     ''', (limit,))
-    rows = cursor.fetchall()
+    tokens = [row[0] for row in cursor.fetchall()]
     conn.close()
     
-    return [{
-        "id": row[0],
-        "event_type": row[1],
-        "dev_wallet": row[2],
-        "token_mint": row[3],
-        "data": json.loads(row[4]) if row[4] else {},
-        "created_at": row[5]
-    } for row in rows]
+    enriched = 0
+    for mint in tokens:
+        try:
+            dex_info = dexscreener_client.get_token_info(mint)
+            if dex_info:
+                existing = DatabaseOps.get_token(mint)
+                if existing:
+                    token_data = {
+                        "mint": mint,
+                        "name": dex_info.get("name") or existing.get("name"),
+                        "symbol": dex_info.get("symbol") or existing.get("symbol"),
+                        "creator": existing.get("creator_wallet"),
+                        "image_uri": dex_info.get("image_uri"),
+                        "twitter": dex_info.get("twitter") or existing.get("twitter_link"),
+                        "website": dex_info.get("website") or existing.get("website_link"),
+                        "market_cap": dex_info.get("market_cap") or existing.get("market_cap"),
+                        "is_graduated": existing.get("is_graduated"),
+                        "graduated_at": existing.get("graduated_at"),
+                        "created_at": existing.get("created_at")
+                    }
+                    DatabaseOps.save_token(token_data)
+                    enriched += 1
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Error enriching {mint[:8]}...: {e}")
+    
+    return {"enriched": enriched, "total": len(tokens)}
+
+
+# WebSocket for real-time updates
+connected_clients: List[WebSocket] = []
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+    await websocket.accept()
+    connected_clients.append(websocket)
     try:
         while True:
-            data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_json({"type": "pong"})
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        connected_clients.remove(websocket)
+
+
+async def broadcast_event(event: Dict):
+    """Broadcast event to all connected clients"""
+    for client in connected_clients:
+        try:
+            await client.send_json(event)
+        except:
+            pass
+
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
